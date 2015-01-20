@@ -1,0 +1,598 @@
+#!/usr/bin/env python
+
+"""
+https://pypi.python.org/pypi/salvage/
+
+In order to make this tool as easy as possible to run on a clean system, it is
+packaged as a single Python executable with no external library dependencies.
+It does require gpg (https://www.gnupg.org/) for the cryptography; you can
+specify a full path to gpg as an option or let it search the shell path.
+
+"""
+
+import argparse
+import functools
+import itertools
+import logging
+import logging.config
+import operator
+import os
+import os.path
+from subprocess import Popen, PIPE
+import sys
+import tarfile
+import unittest
+
+
+#
+# Bits and pieces lifted from six.
+#
+
+PY2 = sys.version_info[0] == 2
+PY3 = sys.version_info[0] == 3
+
+if PY3:
+    iterbytes = iter
+    if sys.version_info[1] <= 1:
+        def int2byte(i):
+            return bytes((i,))
+    else:
+        # This is about 2x faster than the implementation above on 3.2+
+        int2byte = operator.methodcaller("to_bytes", 1, "big")
+    reduce = functools.reduce
+    zip_longest = itertools.zip_longest
+else:
+    iterbytes = functools.partial(itertools.imap, ord)
+    int2byte = chr
+    zip_longest = itertools.izip_longest
+
+
+#
+# A few global utilities.
+#
+
+logger = logging.getLogger('salvage')
+
+
+VERBOSITY = {
+    0: 'ERROR',
+    1: 'WARNING',
+    2: 'INFO',
+    3: 'DEBUG',
+}
+
+
+class CommandError(Exception):
+    """ This can be used to abort execution with an error. """
+    pass
+
+
+gpg_bin = 'gpg'
+
+
+#
+# The command processor.
+#
+
+class Salvage(object):
+    """
+    Argument parser and primary dispatch.
+    """
+    def __init__(self):
+        self.parser = self._init_arg_parser()
+
+    #
+    # Argument parsing
+    #
+
+    def _init_arg_parser(self):
+        """ Initializes our ArgumentParser. """
+        parser = argparse.ArgumentParser()
+        parser.add_argument('-o', '--output', type=self._path(), default='.', help="the output directory [%(default)s]")
+        parser.add_argument('--gpg', default='gpg', help="name or path of your gpg executable [%(default)s]")
+        parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=1, help="Verbosity level (0-3) [%(default)s]")
+        sub = parser.add_subparsers(title="subcommands", dest='action')
+
+        split_parser = sub.add_parser('split', help="encrypt a file or directory and split the key")
+        split_parser.add_argument('-n', '--participants', type=self._positive_int, required=True, help="the total number of participants")
+        split_parser.add_argument('-t', '--threshold', type=self._positive_int, required=True, help="the number required to recover the data")
+        split_parser.add_argument('source', type=self._path(True), help="the file or directory to protect")
+        split_parser.set_defaults(impl=self.split)
+
+        recover_parser = sub.add_parser('recover', help="recover an encrypted item using the reunited pieces")
+        recover_parser.add_argument('pieces', nargs='+', type=self._path(True), help="directories previously created by `salvage split`")
+        split_parser.set_defaults(impl=self.recover)
+
+        test_parser = sub.add_parser('test', help="run unit tests")
+        test_parser.add_argument('test_args', nargs=argparse.REMAINDER)
+        test_parser.set_defaults(impl=self.test)
+
+        return parser
+
+    def _positive_int(self, value):
+        """ Parses and validates a positive integer argument. """
+        try:
+            value = int(value)
+        except Exception as e:
+            raise argparse.ArgumentTypeError(e)
+
+        if value <= 0:
+            raise argparse.ArgumentTypeError("{} is not positive".format(value))
+
+        return value
+
+    def _path(self, exists=False):
+        """
+        An argument type constructor for filesystem paths.
+
+        This will normalize the path and optionally check for existence.
+
+        """
+        def path(value):
+            value = os.path.abspath(os.path.expanduser(value))
+            if exists and (not os.path.exists(value)):
+                raise argparse.ArgumentTypeError("{} does not exist".format(value))
+
+            return value
+
+        return path
+
+    #
+    # Entry point
+    #
+
+    def main(self, argv):
+        """
+        Main entry point.
+
+        This is called from the body of the script and from unit tests.
+
+        """
+        self.args = self.parser.parse_args(argv)
+
+        self._init_globals()
+        self._init_logging()
+
+        try:
+            # Execute the chosen subcommand.
+            self.args.impl()
+        except CommandError as e:
+            logger.error(str(e))
+            sys.exit(1)
+
+    def _init_globals(self):
+        global gpg_bin
+
+        gpg_bin = self.args.gpg
+
+    def _init_logging(self):
+        config = {
+            'version': 1,
+            'formatters': {
+                'console': {
+                    'format': '%(message)s',
+                },
+            },
+            'handlers': {
+                'console': {
+                    'class': 'logging.StreamHandler',
+                    'formatter': 'console',
+                },
+            },
+            'loggers': {
+                'salvage': {
+                    'level': VERBOSITY.get(self.args.verbosity, 'WARNING'),
+                    'handlers': ['console'],
+                },
+            },
+        }
+
+        logging.config.dictConfig(config)
+
+    #
+    # Subcommand implementations
+    #
+
+    def split(self):
+        """ Implements the split subcommand. """
+        if self.args.threshold > self.args.participants:
+            raise CommandError("Threshold must be less than or equal to participants")
+
+        Kit(self.args.output)
+
+    def recover(self):
+        """ Implements the recover subcommand. """
+        pass
+
+    def test(self):
+        """ Implements the test subcommand. """
+        # Remove arguments consumed by our ArgumentParser.
+        argv = sys.argv[:1] + self.args.test_args
+
+        # Conveniently, our own verbosity scale seems to line up nicely with
+        # unittest.
+        unittest.main(argv=argv, verbosity=self.args.verbosity)
+
+
+#
+# A recovery kit is made up of shares.
+#
+
+class Kit(object):
+    """
+    The top-level object that we manipulate.
+
+    A kit is a collection of shares, each of which is a directory on disk. Each
+    share contains data intended for a single participant.
+
+    You don't necessarily need all of the original shares to have a valid kit.
+    When creating a new kit, we will create a share for each participant. When
+    accessing an existing kit, we just need enough shares to reconstruct the
+    master key.
+
+    A kit with all of the original shares is said to be "complete". A kit with
+    at least as many shares as the kit's threshold is said to be "sufficient".
+
+    .. attribute:: shares
+
+        *list*: A list of :class:`Share` objects in this kit.
+
+    .. attribute:: shared_key
+
+        *:class:`SharedKey`*: The key used to access this kit, if available.
+
+    .. attribute:: uuid
+
+        *UUID*: A unique identifier for this kit.
+
+    """
+    @classmethod
+    def create(cls, path, src_path, shared_key):
+        """
+        Creates a new kit.
+
+        :param str path: The directory in which to create the shares.
+        :param str src_path: The file or directory to protect.
+        :param SharedKey shared_key: The :class:`SharedKey` to use. This
+            determines the participant and threshold counts.
+
+        """
+        pass
+
+    @classmethod
+    def load(cls, paths):
+        """
+        Loads an existing kit from a set of shares on disk.
+
+        :param iterable paths: A set of file paths to shares.
+
+        """
+
+    def __init__(self, shares=None, paths=None, shared_key=None):
+        """
+        """
+        self.shared_key = shared_key
+        self.shares = shares if (shares is not None) else self._load_shares(paths)
+
+    def _load_shares(self, paths):
+        """ Loads shares from a set of paths. """
+        pass
+
+    def is_complete(self):
+        """ Returns True iff all shares are present. """
+        return False
+
+    def is_sufficient(self):
+        """ Returns True iff enough shares are present for the threshold. """
+        return False
+
+
+class Share(object):
+    """
+    A single share of a recovery kit.
+
+    A share consists of at least a Locker and a Manifest.
+
+    :param str path: A path to the share on disk.
+
+    """
+    @classmethod
+    def create(self, path, locker, manifest):
+        """
+        Creates a new share.
+
+        :param str path: The path of the new share.
+        :param Locker locker: The locker to copy in.
+        :param Manifest manifest: The manifest to copy in.
+
+        """
+
+    @classmethod
+    def load(self, path):
+        """
+        Loads an existing share.
+
+        :param str path: File path to a share.
+
+        """
+
+    def __init__(self, path, locker=None, manifest=None):
+        self.path = path
+
+        self.locker = locker if (locker is not None) else self._load_locker()
+        self.manfiest = manifest if (manifest is not None) else self._load_manifest()
+
+
+#
+# Each share contains a Manifest and an identical encrypted Locker.
+#
+
+class Manfiest(object):
+    """
+    A Manifest is the metadata that describes a share.
+
+    The manifest is named 'manifest.json' and always lives in its share's top-
+    level directory. It has the following shape:
+
+        {
+            "version": int,
+            "uuid": str,
+            "index": int,
+            "participants": int,
+            "threshold": int,
+            "keys": {
+                subgroup: hex-key,
+                ...
+            }
+        }
+
+    A subgroup is stored as a string consisting of ordered share indexes
+    separated by commas. e.g. "0,3,4".
+
+    """
+    @classmethod
+    def create(cls, share_path, uuid, index, shared_key):
+        """
+        Creates a new manfifest on disk.
+
+        :param str share_path: Path to the root of a share.
+        :param str uuid: The unique identifier for the kit.
+        :param int index: The share index that this manfiest lives in.
+        :param SharedKey shared_kay: The shared key for this kit.
+
+        """
+        pass
+
+    @classmethod
+    def load(cls, path):
+        """
+        Loads and parses an existing manifest.
+
+        :param str path: Full path to manifest.json.
+
+        """
+
+
+class Locker(object):
+    """
+    A Locker is an archive encrypted by gpg with a passphrase.
+
+    This class is used to seal data in a locker and to unpack an existing on.
+
+    :param str path: The path to an existing or intended locker.
+    :param str passphrase: The passphrase used to encrypted the locker.
+    :param str gpg_path: Name or path of your gpg executable. (Default 'gpg')
+
+    """
+    @classmethod
+    def create(cls, share_path, src_path, passphrase):
+        """
+        Creates a new locker from a source file or directory.
+
+        :param str share_path: Path to the parent directory of the new archive.
+        :param str src_path: Path to the source file or directory to archive.
+
+        """
+        tbz_path = src_path + '.salvage.tbz'
+        path = os.path.join(share_path, 'locker.tbz.gpg')
+
+        logger.debug("Creating temporary archive {} from {}".format(tbz_path, src_path))
+        archive = tarfile.open(tbz_path, mode='w|bz2')
+        archive.add(src_path, os.path.basename(src_path))
+        archive.close()
+
+        if os.path.exists(path):
+            logger.warning("Removing existing file at {}".format(path))
+            os.unlink(path)
+
+        cls._run_gpg(
+            '--symmetric', '--armor',
+            '--cipher-algo', 'AES', '--compress-algo', 'none',
+            '--batch', '--passphrase', passphrase,
+            '--output', path, archive.name
+        )
+
+        logger.debug("Removing temporary archive {}".format(tbz_path))
+        os.unlink(tbz_path)
+
+        return cls(path)
+
+    @classmethod
+    def load(cls, path):
+        """
+        Loads an existing Locker from disk.
+
+        :param str path: Path to the encrypted archive.
+
+        """
+        return cls(path)
+
+    def __init__(self, path):
+        self.path = path
+
+    def unpack(self, dst_path, passphrase):
+        """
+        Decrypts a locker and unpacks its contents.
+
+        :param str dst_path: Path to a directory to unpack into.
+
+        """
+        pass
+
+    @classmethod
+    def _run_gpg(self, *args):
+        """
+        Runs a gpg command and returns True if it succeeds.
+        """
+        cmd = [gpg_bin] + args
+
+        logger.debug(' '.join(cmd))
+
+        gpg = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        stdout, stderr = gpg.communicate()
+
+        if stdout:
+            logger.debug(stdout)
+
+        if gpg.returncode != 0:
+            raise CommandError("gpg failed ({}): {}".format(gpg.returncode, stderr))
+
+        return (gpg.returncode == 0)
+
+
+#
+# A Locker is protected by a SharedKey, which is split across participants.
+#
+
+class SharedKey(object):
+    """
+    The master encryption key, plus a SplitKey for each participant subgroup.
+
+    To split the key, we need to know the total number of participants and the
+    number required to recover the key (the threshold).
+
+    :param n int: The total number of participants (0 < n).
+    :param t int: The number of participants required to recover the key
+        (0 < t <= n).
+    :param master str: The master key, or None to generate a random one.
+    :param key_len int: If the master key is not given, the length to generate.
+
+    .. attribute:: master
+
+        *str*: The master encryption key as a byte string. Can be None to
+        generate a random one.
+
+    .. attribute:: splits
+
+        *dict*: Maps participant subgroups to SharedKey objects. Keys in the
+        dict are ordered tuples of participant indexes (e.g. (0, 1, 2), (0, 1,
+        3), ...).
+
+    """
+    def __init__(self, n, t, master=None, key_len=16):
+        """
+        Initializes and splits a symmetric key.
+        """
+        assert (0 < t <= n)
+
+        if master is None:
+            master = os.urandom(key_len)
+        else:
+            key_len = len(master)
+
+        self.n = n
+        self.t = t
+        self.key_len = key_len
+
+        self.master = master
+        self.splits = dict(
+            (indexes, SplitKey.from_master(master, t))
+            for indexes in itertools.combinations(range(n), t)
+        )
+
+
+class SplitKey(tuple):
+    """
+    A tuple of values that xor to a symmetric key.
+    """
+    @classmethod
+    def from_master(cls, master, t):
+        """
+        Creates a shared key from the master key.
+
+        :param master str: The master key (byte string).
+        :param t int: The number of parts to split the key into (threshold).
+
+        """
+        key_len = len(master)
+
+        parts = []
+        for i in range(t - 1):
+            parts.append(os.urandom(key_len))
+        parts.append(xor_str(master, reduce(xor_str, parts)))
+
+        return cls(parts)
+
+    @classmethod
+    def from_parts(cls, parts):
+        """
+        Creates a shared key from its parts.
+
+        :param parts: An iterable of parts that xor to the master key.
+
+        """
+        return cls(parts)
+
+    @property
+    def master(self):
+        """ The original master key. """
+        return reduce(xor_str, self)
+
+
+def xor_str(a, b):
+    """ Returns the xor of two byte strings. """
+    return b''.join(map(int2byte, [x ^ y for x, y in zip_longest(iterbytes(a), iterbytes(b), fillvalue=int2byte(0))]))
+
+
+#
+# Tests
+#
+
+class SharedKeyTests(unittest.TestCase):
+    def test_defaults(self):
+        """ Create a SharedKey with default parameters. """
+        key = SharedKey(5, 3)
+
+        self.assertEqual(len(key.master), key.key_len)
+
+    def test_existing_master(self):
+        """ Create a SharedKey with an existing master key. """
+        key = SharedKey(5, 3, master=b'01234567', key_len=32)
+
+        self.assertEqual(key.master, b'01234567')
+        self.assertEqual(key.key_len, len(key.master))
+
+    def test_key_ken(self):
+        """ Specify a key length. """
+        key = SharedKey(5, 3, key_len=8)
+
+        self.assertEqual(key.key_len, 8)
+        self.assertEqual(len(key.master), 8)
+
+    def test_roundtrip(self):
+        """ Make sure the splits are usable. """
+        key = SharedKey(5, 3, key_len=8)
+
+        for split in key.splits.values():
+            self.assertEqual(
+                SplitKey.from_parts(tuple(split)).master,
+                key.master
+            )
+
+
+#
+# Main entry point
+#
+
+if __name__ == '__main__':
+    Salvage().main(sys.argv[1:])
