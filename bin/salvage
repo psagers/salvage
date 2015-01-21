@@ -44,18 +44,14 @@ logger = logging.getLogger('salvage')
 
 # Verbosity levels to logging levels.
 VERBOSITY = {
-    0: 'ERROR',
-    1: 'WARNING',
-    2: 'INFO',
-    3: 'DEBUG',
+    0: 'CRITICAL',
+    1: 'ERROR',
+    2: 'WARNING',
+    3: 'INFO',
+    4: 'DEBUG',
 }
 
-# Validation checks. These can be selectively ignored.
-INVALID_UUID = 'uuid'
-INVALID_HMAC = 'hmac'
-
-
-# Populated with the output of the argument parser.
+# Global options, as defined by the argument parser.
 options = None
 
 # Only set when running tests.
@@ -82,7 +78,7 @@ class Salvage(object):
         parser = argparse.ArgumentParser()
         parser.add_argument('-o', '--output', type=self._path(), default=os.getcwd(), help="the output directory [%(default)s]")
         parser.add_argument('--gpg', default='gpg', help="name or path of your gpg executable [%(default)s]")
-        parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=1, help="verbosity level (0-3) [%(default)s]")
+        parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=2, help="verbosity level (0-4) [%(default)s]")
         parser.set_defaults(ignore=[])
         sub = parser.add_subparsers(title="commands", dest='action')
 
@@ -93,8 +89,6 @@ class Salvage(object):
         split_parser.set_defaults(impl=self.split)
 
         recover_parser = sub.add_parser('recover', help="recover an encrypted item using the reunited shares")
-        recover_parser.add_argument('--ignore-uuid', action='append_const', const=INVALID_UUID, dest='ignore', help="ignore mismatched UUIDs between shares")
-        recover_parser.add_argument('--ignore-hmac', action='append_const', const=INVALID_HMAC, dest='ignore', help="ignore invalid locker signatures")
         recover_parser.add_argument('shares', nargs='+', type=self._path(True), help="directories previously created by `salvage split`")
         recover_parser.set_defaults(impl=self.recover)
 
@@ -149,16 +143,11 @@ class Salvage(object):
 
         options = self.parser.parse_args(argv)
 
-        self._init_logging()
+        self._init_logging(VERBOSITY.get(options.verbosity, 'WARNING'))
 
-        try:
-            # Execute the chosen subcommand.
-            options.impl()
-        except SalvageError as e:
-            logger.error(str(e))
-            sys.exit(1)
+        options.impl()
 
-    def _init_logging(self):
+    def _init_logging(self, level):
         config = {
             'version': 1,
             'formatters': {
@@ -174,7 +163,7 @@ class Salvage(object):
             },
             'loggers': {
                 'salvage': {
-                    'level': VERBOSITY.get(options.verbosity, 'WARNING'),
+                    'level': level,
                     'handlers': ['console'],
                 },
             },
@@ -188,16 +177,15 @@ class Salvage(object):
 
     def split(self):
         """ Implements the split subcommand. """
-        if options.threshold > options.participants:
-            raise SalvageError("Threshold must be less than or equal to participants")
 
     def recover(self):
         """ Implements the recover subcommand. """
-        pass
 
     def test(self):
         """ Implements the test subcommand. """
         global test_work_path
+
+        self._init_logging('CRITICAL')
 
         if options.working is not None:
             test_work_path = options.working
@@ -207,9 +195,7 @@ class Salvage(object):
         # Remove arguments consumed by our ArgumentParser.
         argv = sys.argv[:1] + options.test_args
 
-        # Conveniently, our own verbosity scale seems to line up nicely with
-        # unittest.
-        unittest.main(argv=argv, verbosity=options.verbosity)
+        unittest.main(argv=argv, verbosity=options.verbosity - 1)
 
         # Clean up the temp directory if it didn't come from the user.
         if options.working is None:
@@ -253,8 +239,10 @@ class Kit(object):
         """
         shares = []
 
-        kit_uuid = str(uuid.uuid1())
+        kit_uuid = uuid.uuid1()
         share_paths = cls._ensure_share_paths(path, shared_key.n)
+        if share_paths is None:
+            return None
 
         locker = Locker.create(share_paths[0], src_path, shared_key.master)
 
@@ -279,9 +267,12 @@ class Kit(object):
             path = os.path.join(root_path, 'salvage-share-{}'.format(i))
             if not os.path.exists(path):
                 os.makedirs(path)
-            elif not os.path.isdir(path):
-                raise SalvageError("{} already exists and is not a directory".format(path))
-            paths.append(path)
+            if os.path.isdir(path):
+                paths.append(path)
+            else:
+                logger.error("{} already exists and is not a directory".format(path))
+                paths = None
+                break
 
         return paths
 
@@ -293,16 +284,51 @@ class Kit(object):
         :param iterable paths: A collection of file paths to shares.
 
         """
-        kit = cls(map(Share.load, paths))
+        kit = cls(filter(None, map(Share.load, paths)))
         kit.validate()
 
         return kit
 
     def __init__(self, shares):
-        self.shares = list(shares)
+        self._shares = set(shares)
 
-        if len(self.shares) < 2:
-            raise ValueError("At least 2 Shares are required to make a Kit.")
+    @property
+    def share_count(self):
+        """ The number of shares loaded. """
+        return len(self._shares)
+
+    @property
+    def shares(self):
+        """ The sorted list of shares. """
+        return sorted(self._shares)
+
+    #
+    # Incremental kit assembly
+    #
+
+    def add_share(self, share):
+        """ Adds another share to the kit. """
+        self._shares.add(share)
+
+    def remove_share(self, share):
+        """ Removes a share from the kit. """
+        self._shares.discard(share)
+
+    #
+    # State queries
+    #
+
+    def is_complete(self):
+        """ Returns True iff all shares are present. """
+        return (len(self._shares) == self.participants)
+
+    def is_sufficient(self):
+        """ Returns True iff enough shares are present for the threshold. """
+        return (len(self._shares) >= self.threshold)
+
+    #
+    # Recovery
+    #
 
     def validate(self):
         """
@@ -310,40 +336,24 @@ class Kit(object):
         """
 
     def unpack(self, dst_path):
-        """ Unpack the locker into the output directory. """
+        """
+        Unpack the locker into the output directory.
+
+        Returns True iff the unpack is successful.
+
+        """
         if not self.is_sufficient():
-            raise SalvageError("Insufficient shares to recover.")
+            logger.warning("Unable to reassemble kit: insufficient shares.")
+            success = False
+        else:
+            success = self.locker.unpack(dst_path, self.master_key(), self.mac)
 
-        self.locker.unpack(dst_path, self.master_key(), self.mac)
-
-    def is_complete(self):
-        """ Returns True iff all shares are present. """
-        return (len(self.shares) == self.participants)
-
-    def is_sufficient(self):
-        """ Returns True iff enough shares are present for the threshold. """
-        return (len(self.shares) >= self.threshold)
-
-    @property
-    def locker(self):
-        return self.shares[0].locker
-
-    @property
-    def participants(self):
-        return self.shares[0].manifest.participants
-
-    @property
-    def threshold(self):
-        return self.shares[0].manifest.threshold
-
-    @property
-    def mac(self):
-        return self.shares[0].manifest.mac
+        return success
 
     def master_key(self):
         """ Reconstruct the master key. """
         if self.is_sufficient():
-            shares = self.shares[:self.threshold]
+            shares = list(self._shares)[:self.threshold]
             group = tuple(sorted(share.manifest.share_idx for share in shares))
             key = SplitKey(share.manifest.keys[group] for share in shares).master
         else:
@@ -351,7 +361,36 @@ class Kit(object):
 
         return key
 
+    #
+    # Kit parameters, taken from an arbitrary manifest.
+    #
 
+    @property
+    def locker(self):
+        return (self.any_share().locker if self._shares else None)
+
+    @property
+    def uuid(self):
+        return (self.any_share().manifest.uuid if self._shares else None)
+
+    @property
+    def participants(self):
+        return (self.any_share().manifest.participants if self._shares else None)
+
+    @property
+    def threshold(self):
+        return (self.any_share().manifest.threshold if self._shares else None)
+
+    @property
+    def mac(self):
+        return (self.any_share().manifest.mac if self._shares else None)
+
+    def any_share(self):
+        """ Returns an arbitrary share from our set. """
+        return next(iter(self._shares), None)
+
+
+@functools.total_ordering
 class Share(object):
     """
     A single share of a recovery kit.
@@ -381,19 +420,61 @@ class Share(object):
         :param str path: File path to a share.
 
         """
-        return cls(path)
+        locker = Locker.load(os.path.join(path, Locker.filename))
+        manifest = Manifest.load(os.path.join(path, Manifest.filename))
 
-    def __init__(self, path, locker=None, manifest=None):
+        if (locker is not None) and (manifest is not None):
+            share = cls(path, locker, manifest)
+        else:
+            share = None
+
+        return share
+
+    def __init__(self, path, locker, manifest):
+        if not isinstance(locker, Locker):
+            raise TypeError("Not a valid Locker instance")
+        if not isinstance(manifest, Manifest):
+            raise TypeError("Not a valid Manifest instance")
+
         self.path = path
+        self.locker = locker
+        self.manifest = manifest
 
-        self.locker = locker if (locker is not None) else self._load_locker(path)
-        self.manifest = manifest if (manifest is not None) else self._load_manifest(path)
+    #
+    # Manifest shortcuts
+    #
 
-    def _load_locker(self, share_path):
-        return Locker.load(os.path.join(share_path, Locker.filename))
+    @property
+    def uuid(self):
+        return self.manifest.uuid
 
-    def _load_manifest(self, share_path):
-        return Manifest.load(os.path.join(share_path, Manifest.filename))
+    @property
+    def index(self):
+        return self.manifest.share_idx
+
+    #
+    # A share is uniquely identified and orderable by Kit uuid and index.
+    #
+
+    def __hash__(self):
+        return hash(self._identity)
+
+    def __eq__(self, other):
+        if not isinstance(other, Share):
+            return NotImplemented
+        else:
+            return (self._identity == other._identity)
+
+    def __lt__(self, other):
+        if not isinstance(other, Share):
+            return NotImplemented
+        else:
+            return (self._identity < other._identity)
+
+    @property
+    def _identity(self):
+        """ A value uniquely identifying this logical share. """
+        return (self.manifest.uuid, self.manifest.share_idx)
 
 
 #
@@ -420,6 +501,8 @@ class Locker(object):
         :param bytes key: The binary key to encrypt the data with.
 
         """
+        locker = None
+
         tbz_path = src_path + '.salvage.tbz'
         path = os.path.join(dest_path, Locker.filename)
 
@@ -434,17 +517,21 @@ class Locker(object):
             logger.warning("Removing existing file at {}".format(path))
             os.unlink(path)
 
-        cls._run_gpg(
+        ok = cls._run_gpg(
             '--symmetric', '--armor',
             '--cipher-algo', 'AES', '--compress-algo', 'none',
             '--batch', '--passphrase', hexlify(key).decode('ascii'),
             '--output', path, archive.name
         )
 
-        logger.debug("Removing temporary archive {}".format(tbz_path))
-        os.unlink(tbz_path)
+        if os.path.exists(tbz_path):
+            logger.debug("Removing temporary archive {}".format(tbz_path))
+            os.unlink(tbz_path)
 
-        return cls(path, mac)
+        if ok:
+            locker = cls(path, mac)
+
+        return locker
 
     @classmethod
     def load(cls, path, mac=None):
@@ -462,11 +549,14 @@ class Locker(object):
 
     def copy(self, dest_path):
         """
-        Copies this locker to a new path.
+        Copies this locker to a new parent directory.
+
+        Returns a new Locker object for the copy.
+
         """
         shutil.copy(self.path, dest_path)
 
-        return Locker(self.path, self.mac)
+        return Locker(os.path.join(dest_path, self.filename), self.mac)
 
     def unpack(self, dst_path, key, mac):
         """
@@ -479,30 +569,36 @@ class Locker(object):
         """
         tbz_path = os.path.splitext(self.path)[0]
 
-        self._run_gpg(
+        success = self._run_gpg(
             '--batch', '--passphrase', hexlify(key).decode('ascii'),
             '--output', tbz_path, self.path
         )
 
-        computed_mac = self._path_hmac(tbz_path, key)
-        if computed_mac != mac:
-            validation_error(INVALID_HMAC, "The locker did not decrypt correctly. This might mean that the archive or manifest was tampered with. (--ignore-hmac to ignore).")
-        else:
-            self.mac = mac
+        if success:
+            computed_mac = self._path_hmac(tbz_path, key)
+            if computed_mac != mac:
+                logger.error("The locker did not decrypt correctly. This might mean that the archive or manifest was tampered with.")
+                success = False
+            else:
+                self.mac = mac
 
-        archive = tarfile.open(tbz_path)
-        archive.extractall(dst_path)
-        archive.close()
+        if success:
+            archive = tarfile.open(tbz_path)
+            archive.extractall(dst_path)
+            archive.close()
 
-        logger.debug("Removing temporary archive {}".format(tbz_path))
-        os.unlink(tbz_path)
+        if os.path.exists(tbz_path):
+            logger.debug("Removing temporary archive {}".format(tbz_path))
+            os.unlink(tbz_path)
+
+        return success
 
     @classmethod
     def _run_gpg(self, *args):
         """
         Runs a gpg command.
 
-        Raises a Command error if it fails.
+        Returns True iff it succeeds.
 
         """
         cmd = [options.gpg] + list(args)
@@ -513,10 +609,14 @@ class Locker(object):
             gpg = Popen(cmd, stdin=PIPE, stdout=PIPE, stderr=PIPE)
             stdout, stderr = gpg.communicate()
         except OSError as e:
-            raise SalvageError(e)
+            logger.error(e)
+            success = False
+        else:
+            success = (gpg.returncode == 0)
+            if not success:
+                logger.error("gpg failed ({}): {}".format(gpg.returncode, stderr))
 
-        if gpg.returncode != 0:
-            raise SalvageError("gpg failed ({}): {}".format(gpg.returncode, stderr))
+        return success
 
     @classmethod
     def _path_hmac(self, path, key, digest=hashlib.sha256):
@@ -541,7 +641,7 @@ class Manifest(object):
 
         {
             "version": int,
-            "uuid": str,
+            "urn": str,
             "share_idx": int,
             "mac": str,
             "participants": int,
@@ -553,8 +653,8 @@ class Manifest(object):
         }
 
     * *version*: The current version is 1.
-    * *uuid*: Identifies the kit that this share belongs to. The uuid is
-      rendered in its hyphenated, hex-encoded form.
+    * *urn*: Identifies the kit that this share belongs to. In version 1, this
+      must be an RFC 4122 UUID.
     * *share_idx*: The (zero-based) index of this share within its kit.
     * *mac*: The hex-encoded SHA-256-HMAC of the unencrypted archive.
     * *participants*: The total number of shares in the kit (n).
@@ -574,7 +674,7 @@ class Manifest(object):
         """
         Creates a new manfifest for a share.
 
-        :param str kit_uuid: The unique identifier for the kit.
+        :param UUID kit_uuid: The unique identifier for the kit.
         :param int share_idx: The index of the share that this manifest
             describes.
         :param bytes mac: The HMAC of the unencrypted archive.
@@ -598,15 +698,19 @@ class Manifest(object):
         Loads and parses an existing manifest.
 
         :param str path: Full path to salvage.json.
+        :returns: :class:`Manifest` or None.
 
         """
+        manifest = None
+
         logger.info("Loading manfest from {}".format(path))
-        with open(path, 'r') as f:
-            jsonable = json.load(f)
 
         try:
+            with open(path, 'r') as f:
+                jsonable = json.load(f)
+
             version = jsonable['version']
-            kit_uuid = jsonable['uuid']
+            kit_uuid = uuid.UUID(jsonable['urn'])
             share_idx = jsonable['share_idx']
             mac = unhexlify(jsonable['mac'].encode('ascii'))
             participants = jsonable['participants']
@@ -616,9 +720,11 @@ class Manifest(object):
                 for idxs, key in jsonable['keys']
             )
         except Exception as e:
-            raise SalvageError("Error parsing manifest at {}: {}".format(path, e))
+            logger.error("Error parsing manifest at {}: {}".format(path, e))
+        else:
+            manifest = cls(version, kit_uuid, share_idx, mac, participants, threshold, keys)
 
-        return cls(version, kit_uuid, share_idx, mac, participants, threshold, keys)
+        return manifest
 
     def __init__(self, version, kit_uuid, share_idx, mac, participants, threshold, keys):
         self.version = version
@@ -645,7 +751,7 @@ class Manifest(object):
         """ Returns our JSON-friendly representation. """
         return OrderedDict([
             ('version', self.version),
-            ('uuid', self.uuid),
+            ('urn', self.uuid.urn),
             ('share_idx', self.share_idx),
             ('mac', hexlify(self.mac).decode('ascii')),
             ('participants', self.participants),
@@ -723,7 +829,7 @@ class SplitKey(tuple):
         parts = []
         for i in range(t - 1):
             parts.append(os.urandom(key_len))
-        parts.append(xor_str(master, reduce(xor_str, parts)))
+        parts.append(xor_str(master, functools.reduce(xor_str, parts)))
 
         return cls(parts)
 
@@ -740,28 +846,12 @@ class SplitKey(tuple):
     @property
     def master(self):
         """ The original master key. """
-        return reduce(xor_str, self)
+        return functools.reduce(xor_str, self)
 
 
 def xor_str(a, b):
     """ Returns the xor of two byte strings. """
     return b''.join(map(int2byte, [x ^ y for x, y in zip_longest(iterbytes(a), iterbytes(b), fillvalue=int2byte(0))]))
-
-
-#
-# Error handling
-#
-
-class SalvageError(Exception):
-    pass
-
-
-def validation_error(code, message):
-    """ Called to report an ignorable validation error. """
-    if code in options.ignore:
-        logger.warning("IGNORED: " + message)
-    else:
-        raise SalvageError(message)
 
 
 #
@@ -778,7 +868,6 @@ if PY3:
     else:
         # This is about 2x faster than the implementation above on 3.2+
         int2byte = operator.methodcaller("to_bytes", 1, "big")
-    reduce = functools.reduce
     zip_longest = itertools.zip_longest
 else:
     iterbytes = functools.partial(itertools.imap, ord)
@@ -918,37 +1007,50 @@ class LockerTestCase(BaseTestCase):
             self.assertEqual(f.read(), b'testing')
         self.assertEqual(locker.mac, locker0.mac)
 
+    def test_copy(self):
+        """ Copy a locker to a new directory. """
+        src_path = self.work_path('src', True)
+        dst_path = self.work_path('dst', True)
+
+        locker0 = Locker.create(src_path, self.content_path(), b'01234567')
+        locker1 = locker0.copy(dst_path)
+
+        self.assertEqual(locker1.path, os.path.join(dst_path, Locker.filename))
+
     def test_bad_key(self):
         """ Try to unpack a locker with the wrong key. """
         locker = Locker.create(self.tempdir, self.content_path(), b'01234567')
 
-        with self.assertRaises(SalvageError):
-            locker.unpack(self.work_path('unpacked', create=True), b'bogus', locker.mac)
+        success = locker.unpack(self.work_path('unpacked', create=True), b'bogus', locker.mac)
+
+        self.assertFalse(success)
 
     def test_bad_hmac(self):
         """ Detect a bad HMAC on an existing locker. """
         locker = Locker.create(self.tempdir, self.content_path(), b'01234567')
         locker = Locker.load(self.work_path(Locker.filename))
 
-        with self.assertRaises(SalvageError):
-            locker.unpack(self.work_path('unpacked', create=True), b'01234567', b'bogus-mac')
-        self.assertEqual(locker.mac, None)
+        success = locker.unpack(self.work_path('unpacked', create=True), b'01234567', b'bogus-mac')
+
+        self.assertFalse(success)
 
     def test_no_gpg(self):
         """ Try to create a locker when gpg is not available. """
-        global gpg_bin
-
         gpg_save = options.gpg
         options.gpg = 'bogus_gpg'
-        with self.assertRaises(SalvageError):
-            Locker.create(self.tempdir, self.content_path(), b'01234567')
-        options.gpg = gpg_save
+        try:
+            locker = Locker.create(self.tempdir, self.content_path(), b'01234567')
+        finally:
+            options.gpg = gpg_save
+
+        self.assertTrue(locker is None)
 
 
 class ManifestTestCase(BaseTestCase):
     def setUp(self):
+        self.uuid = uuid.uuid1()
         self.key = SharedKey(3, 2, b'0123456')
-        self.manifest = Manifest.new('my-uuid', 1, b'test-mac', self.key)
+        self.manifest = Manifest.new(self.uuid, 1, b'test-mac', self.key)
 
     def test_new(self):
         """ Create a new manifest. """
@@ -972,13 +1074,14 @@ class ManifestTestCase(BaseTestCase):
         with open(self.work_path(Manifest.filename), 'w') as f:
             json.dump(jsonable, f)
 
-        with self.assertRaises(SalvageError):
-            Manifest.load(self.work_path(Manifest.filename))
+        manifest = Manifest.load(self.work_path(Manifest.filename))
+
+        self.assertTrue(manifest is None)
 
     def assertManifestContent(self, manifest):
         """ Asserts the properties of our standard test manifest. """
         self.assertEqual(manifest.version, 1)
-        self.assertEqual(manifest.uuid, 'my-uuid')
+        self.assertEqual(manifest.uuid, self.uuid)
         self.assertEqual(manifest.share_idx, 1)
         self.assertEqual(manifest.mac, b'test-mac')
         self.assertEqual(manifest.participants, 3)
@@ -987,6 +1090,22 @@ class ManifestTestCase(BaseTestCase):
         self.assertEqual(list(manifest.keys.keys()), [(0, 1), (1, 2)])
         self.assertEqual(manifest.keys[(0, 1)], self.key.splits[(0, 1)][1])
         self.assertEqual(manifest.keys[(1, 2)], self.key.splits[(1, 2)][0])
+
+
+class ShareTestCase(BaseTestCase):
+    def test_bad_share(self):
+        share = Share.load(self.tempdir)
+
+        self.assertTrue(share is None)
+
+    def test_share_init(self):
+        locker = Locker.create(self.tempdir, self.content_path(), b'01234567')
+        manifest = Manifest.new(uuid.uuid1(), 1, b'test-mac', SharedKey(3, 2, b'01234567'))
+
+        with self.assertRaises(TypeError):
+            Share(self.tempdir, None, manifest)
+        with self.assertRaises(TypeError):
+            Share(self.tempdir, locker, None)
 
 
 class KitTestCase(BaseTestCase):
@@ -1014,6 +1133,16 @@ class KitTestCase(BaseTestCase):
                 self.assertTrue(Locker.filename in filenames)
                 self.assertTrue(Manifest.filename in filenames)
 
+    def test_collision(self):
+        kit_path = self.work_path('kit', True)
+        share_path = self.work_path('kit/salvage-share-1')
+        with open(share_path, 'w'):
+            pass
+
+        kit = Kit.create(kit_path, self.content_path(), self.key)
+
+        self.assertTrue(kit is None)
+
     def test_load(self):
         kit_path = self.work_path('kit', True)
 
@@ -1021,6 +1150,21 @@ class KitTestCase(BaseTestCase):
         kit = Kit.load(os.path.join(kit_path, share_dir) for share_dir in os.listdir(kit_path))
 
         self.assertTrue(kit.is_complete())
+        self.assertTrue(kit.is_sufficient())
+
+    def test_sufficient(self):
+        kit_path = self.work_path('kit', True)
+
+        Kit.create(kit_path, self.content_path(), self.key)
+        kit = Kit.load(
+            os.path.join(kit_path, share_dir)
+            for share_dir in os.listdir(kit_path)[:self.key.t]
+        )
+
+        success = kit.unpack(self.work_path('unpacked'))
+
+        self.assertTrue(success)
+        self.assertFalse(kit.is_complete())
         self.assertTrue(kit.is_sufficient())
 
     def test_roundtrip(self):
@@ -1032,16 +1176,50 @@ class KitTestCase(BaseTestCase):
         with open(self.work_path('unpacked/content/secrets.txt'), 'rb') as f:
             self.assertEqual(f.read(), b'testing')
 
+    def test_share_ordering(self):
+        kit = Kit.create(self.work_path('kit', True), self.content_path(), self.key)
+
+        self.assertEqual([share.index for share in kit.shares], list(range(self.key.n)))
+        self.assertEqual(kit.shares[0], kit.shares[0])
+
+    def test_incremental(self):
+        kit_path = self.work_path('kit', True)
+
+        Kit.create(kit_path, self.content_path(), self.key)
+        kit = Kit.load([])
+
+        self.assertEqual(kit.share_count, 0)
+
+        for dirname in os.listdir(kit_path):
+            kit.add_share(Share.load(os.path.join(kit_path, dirname)))
+
+        self.assertEqual(kit.share_count, self.key.n)
+
+        for dirname in os.listdir(kit_path):
+            kit.add_share(Share.load(os.path.join(kit_path, dirname)))
+
+        self.assertEqual(kit.share_count, self.key.n)
+
+        for dirname in os.listdir(kit_path)[:2]:
+            kit.remove_share(Share.load(os.path.join(kit_path, dirname)))
+
+        self.assertEqual(kit.share_count, self.key.n - 2)
+
     def test_insufficient(self):
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
-        kit = Kit.load(os.path.join(kit_path, share_dir) for share_dir in os.listdir(kit_path)[:2])
+        kit = Kit.load(
+            os.path.join(kit_path, share_dir)
+            for share_dir in os.listdir(kit_path)[:self.key.t - 1]
+        )
 
+        success = kit.unpack(self.work_path('unpacked'))
+
+        self.assertFalse(success)
         self.assertFalse(kit.is_complete())
         self.assertFalse(kit.is_sufficient())
-        with self.assertRaises(SalvageError):
-            kit.unpack(self.work_path('unpacked'))
+        self.assertTrue(kit.master_key() is None)
 
 
 class SalvageTestCase(BaseTestCase):
