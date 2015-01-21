@@ -83,8 +83,8 @@ class Salvage(object):
         sub = parser.add_subparsers(title="commands", dest='action')
 
         split_parser = sub.add_parser('split', help="encrypt a file or directory and split the key")
-        split_parser.add_argument('-n', '--participants', type=self._positive_int, required=True, help="the total number of participants")
-        split_parser.add_argument('-t', '--threshold', type=self._positive_int, required=True, help="the number required to recover the data")
+        split_parser.add_argument('-n', '--participants', type=self._at_least_2, required=True, help="the total number of participants")
+        split_parser.add_argument('-t', '--threshold', type=self._at_least_2, required=True, help="the number required to recover the data")
         split_parser.add_argument('source', type=self._path(True), help="the file or directory to protect")
         split_parser.set_defaults(impl=self.split)
 
@@ -100,15 +100,15 @@ class Salvage(object):
 
         return parser
 
-    def _positive_int(self, value):
-        """ Parses and validates a positive integer argument. """
+    def _at_least_2(self, value):
+        """ Parses and validates an integer >= 2. """
         try:
             value = int(value)
         except Exception as e:
             raise argparse.ArgumentTypeError(e)
 
-        if value <= 0:
-            raise argparse.ArgumentTypeError("{} is not positive".format(value))
+        if value < 2:
+            raise argparse.ArgumentTypeError("{} must be at least 2".format(value))
 
         return value
 
@@ -145,7 +145,7 @@ class Salvage(object):
 
         self._init_logging(VERBOSITY.get(options.verbosity, 'WARNING'))
 
-        options.impl()
+        return options.impl()
 
     def _init_logging(self, level):
         config = {
@@ -177,9 +177,39 @@ class Salvage(object):
 
     def split(self):
         """ Implements the split subcommand. """
+        if options.threshold > options.participants:
+            logger.warning("Setting the threshold to {}".format(options.participants))
+            options.threshold = options.participants
+
+        key = SharedKey(options.participants, options.threshold)
+        kit = Kit.create(options.output, options.source, key)
+
+        if options.verbosity > 0:
+            if kit is not None:
+                print("Recovery kit for {} created in {}".format(options.source, options.output))
+            else:
+                print("Failed to create recovery kit for {}".format(options.source))
+
+        return (0 if (kit is not None) else 1)
 
     def recover(self):
         """ Implements the recover subcommand. """
+        kit = Kit.load(options.shares)
+        dst_path = os.path.join(options.output, 'salvage-{}'.format(kit.uuid))
+
+        if not kit.is_sufficient():
+            logger.error("This salvage kit requires {} shares for recovery, but only {} were given.".format(kit.threshold, kit.share_count))
+            success = False
+        else:
+            success = kit.unpack(dst_path)
+
+        if options.verbosity > 0:
+            if success:
+                print("Salvage kit successfully recovered to {}".format(dst_path))
+            else:
+                print("Failed to recover salvage kit to {}".format(options.output))
+
+        return (0 if success else 1)
 
     def test(self):
         """ Implements the test subcommand. """
@@ -226,6 +256,9 @@ class Kit(object):
         *list*: A list of :class:`Share` objects in this kit.
 
     """
+    def __init__(self, shares=[]):
+        self._shares = set(shares)
+
     @classmethod
     def create(cls, path, src_path, shared_key):
         """
@@ -284,13 +317,12 @@ class Kit(object):
         :param iterable paths: A collection of file paths to shares.
 
         """
-        kit = cls(filter(None, map(Share.load, paths)))
-        kit.validate()
+        shares = filter(None, map(Share.load, paths))
+        kit = Kit()
+        for share in shares:
+            kit.add_share(share)
 
         return kit
-
-    def __init__(self, shares):
-        self._shares = set(shares)
 
     @property
     def share_count(self):
@@ -307,8 +339,27 @@ class Kit(object):
     #
 
     def add_share(self, share):
-        """ Adds another share to the kit. """
-        self._shares.add(share)
+        """
+        Adds another share to the kit.
+
+        The share will be rejected if it does not match shares already in the
+        kit. If the share has already been added (even from a different path),
+        this does nothing.
+
+        :param share: The share to add.
+        :type share: :class:`Share`.
+        :returns: bool
+
+        """
+        existing = self.any_share
+        if (existing is not None) and (share.kit_fingerprint != existing.kit_fingerprint):
+            logger.warning("Ignoring the share at {} because it does not belong with the shares already loaded.".format(share.path))
+            success = False
+        else:
+            self._shares.add(share)
+            success = True
+
+        return success
 
     def remove_share(self, share):
         """ Removes a share from the kit. """
@@ -351,7 +402,12 @@ class Kit(object):
         return success
 
     def master_key(self):
-        """ Reconstruct the master key. """
+        """
+        Reconstructs the master key.
+
+        :returns: bytes or None
+
+        """
         if self.is_sufficient():
             shares = list(self._shares)[:self.threshold]
             group = tuple(sorted(share.manifest.share_idx for share in shares))
@@ -367,24 +423,25 @@ class Kit(object):
 
     @property
     def locker(self):
-        return (self.any_share().locker if self._shares else None)
+        return (self.any_share.locker if self._shares else None)
 
     @property
     def uuid(self):
-        return (self.any_share().manifest.uuid if self._shares else None)
+        return (self.any_share.manifest.uuid if self._shares else None)
 
     @property
     def participants(self):
-        return (self.any_share().manifest.participants if self._shares else None)
+        return (self.any_share.manifest.participants if self._shares else None)
 
     @property
     def threshold(self):
-        return (self.any_share().manifest.threshold if self._shares else None)
+        return (self.any_share.manifest.threshold if self._shares else None)
 
     @property
     def mac(self):
-        return (self.any_share().manifest.mac if self._shares else None)
+        return (self.any_share.manifest.mac if self._shares else None)
 
+    @property
     def any_share(self):
         """ Returns an arbitrary share from our set. """
         return next(iter(self._shares), None)
@@ -443,6 +500,10 @@ class Share(object):
     #
     # Manifest shortcuts
     #
+
+    @property
+    def kit_fingerprint(self):
+        return self.manifest.kit_fingerprint
 
     @property
     def uuid(self):
@@ -514,7 +575,7 @@ class Locker(object):
         mac = cls._path_hmac(tbz_path, key)
 
         if os.path.exists(path):
-            logger.warning("Removing existing file at {}".format(path))
+            logger.warning("Replacing existing file {}".format(path))
             os.unlink(path)
 
         ok = cls._run_gpg(
@@ -554,6 +615,10 @@ class Locker(object):
         Returns a new Locker object for the copy.
 
         """
+        new_path = os.path.join(dest_path, os.path.basename(self.path))
+        if os.path.exists(new_path):
+            logger.warning("Replacing existing file {}".format(new_path))
+
         shutil.copy(self.path, dest_path)
 
         return Locker(os.path.join(dest_path, self.filename), self.mac)
@@ -744,6 +809,9 @@ class Manifest(object):
         """
         path = os.path.join(share_path, self.filename)
         logger.info("Writing manfest to {}".format(path))
+        if os.path.exists(path):
+            logger.warning("Replacing existing file {}".format(path))
+
         with open(path, 'w') as f:
             json.dump(self.to_jsonable(), f, indent=2)
 
@@ -758,6 +826,17 @@ class Manifest(object):
             ('threshold', self.threshold),
             ('keys', [(idxs, hexlify(key).decode('ascii')) for idxs, key in self.keys.items()]),
         ])
+
+    @property
+    def kit_fingerprint(self):
+        """
+        A value unique to this manifest's kit.
+
+        This value can be used to decide whether two manifests belong to the
+        same kit and have (probably) not been tampered with.
+
+        """
+        return (self.version, self.uuid, self.mac, self.participants, self.threshold)
 
 
 #
@@ -1205,6 +1284,20 @@ class KitTestCase(BaseTestCase):
 
         self.assertEqual(kit.share_count, self.key.n - 2)
 
+    def test_mismatched_share(self):
+        kit1_path = self.work_path('kit1', True)
+        kit2_path = self.work_path('kit2', True)
+
+        Kit.create(kit1_path, self.content_path(), self.key)
+        Kit.create(kit2_path, self.content_path(), self.key)
+        kit = Kit()
+
+        success1 = kit.add_share(Share.load(os.path.join(kit1_path, os.listdir(kit1_path)[0])))
+        success2 = kit.add_share(Share.load(os.path.join(kit2_path, os.listdir(kit1_path)[0])))
+
+        self.assertTrue(success1)
+        self.assertFalse(success2)
+
     def test_insufficient(self):
         kit_path = self.work_path('kit', True)
 
@@ -1223,7 +1316,18 @@ class KitTestCase(BaseTestCase):
 
 
 class SalvageTestCase(BaseTestCase):
-    pass
+    def _test_split(self):
+        src_path = self.content_path()
+        kit_path = self.tempdir
+
+        Salvage().main(['-o', kit_path, 'split', '-n', '3', '-t', '2', src_path])
+
+        kit = Kit.load(
+            os.path.join(kit_path, share_dir)
+            for share_dir in os.listdir(kit_path)
+        )
+
+        self.assertTrue(kit.is_complete())
 
 
 #
@@ -1231,4 +1335,6 @@ class SalvageTestCase(BaseTestCase):
 #
 
 if __name__ == '__main__':
-    Salvage().main(sys.argv[1:])
+    rc = Salvage().main(sys.argv[1:])
+    if rc != 0:
+        sys.exit(rc)
