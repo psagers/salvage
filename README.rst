@@ -25,8 +25,8 @@ Installation
 
     ``$ pip install salvage``
 
-This package will only install the `salvage` executable. Salvage does not depend
-on any Python packages, but it does require `gpg`_ to handle the cryptography.
+This package will only install the ``salvage`` executable. It does not depend on
+any Python packages.
 
 
 Quick Start
