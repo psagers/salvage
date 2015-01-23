@@ -23,7 +23,9 @@ Disclosure
 
 This is the easier one, as all of the usual rules apply. Each share of a salvage
 kit should be handled as if it were the raw data. Ideally, it will only exist on
-physical media and be stored like any other valuable and sensitive document.
+physical media and be stored like any other valuable and sensitive document. You
+can alway apply extra protection to each share, such as encrypting it with the
+public key of the intended recipient.
 
 Depending on your level of paranoia, you might also give some thought to how you
 prepare the kit. In order to create it, you need to have the original
