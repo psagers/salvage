@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 
-from __future__ import unicode_literals
+from __future__ import unicode_literals, print_function
 
 """
 https://pypi.python.org/pypi/salvage/
@@ -56,6 +56,7 @@ options = None
 
 # Only set when running tests.
 test_work_path = None
+test_keep_files = False
 
 
 #
@@ -76,20 +77,20 @@ class Salvage(object):
     def _init_arg_parser(self):
         """ Initializes our ArgumentParser. """
         parser = argparse.ArgumentParser()
-        parser.add_argument('-o', '--output', type=self._path(), default=os.getcwd(), help="the output directory [%(default)s]")
+        parser.add_argument('-o', '--output', type=self._path(True), default=os.getcwd(), help="the output directory [%(default)s]")
         parser.add_argument('--gpg', default='gpg', help="name or path of your gpg executable [%(default)s]")
         parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=2, help="verbosity level (0-4) [%(default)s]")
-        parser.set_defaults(ignore=[])
         sub = parser.add_subparsers(title="commands", dest='action')
 
-        split_parser = sub.add_parser('split', help="encrypt a file or directory and split the key")
-        split_parser.add_argument('-n', '--participants', type=self._at_least_2, required=True, help="the total number of participants")
-        split_parser.add_argument('-t', '--threshold', type=self._at_least_2, required=True, help="the number required to recover the data")
-        split_parser.add_argument('source', type=self._path(True), help="the file or directory to protect")
-        split_parser.set_defaults(impl=self.split)
+        new_parser = sub.add_parser('new', help="create a new salvate kit from a source file or directory")
+        new_parser.add_argument('participants', type=self._at_least_2, help="the total number of participants")
+        new_parser.add_argument('threshold', type=self._at_least_2, help="the number required to recover the data")
+        new_parser.add_argument('source', type=self._path(True), help="the file or directory to protect")
+        new_parser.set_defaults(impl=self.new)
 
         recover_parser = sub.add_parser('recover', help="recover an encrypted item using the reunited shares")
-        recover_parser.add_argument('shares', nargs='+', type=self._path(True), help="directories previously created by `salvage split`")
+        recover_parser.add_argument('--no-gpg', action='store_true', help="don't decrypt the data, just recover the key")
+        recover_parser.add_argument('shares', nargs='+', type=self._path(True), help="directories previously created by `salvage new`")
         recover_parser.set_defaults(impl=self.recover)
 
         test_parser = sub.add_parser('test', help="run unit tests")
@@ -132,7 +133,7 @@ class Salvage(object):
     # Entry point
     #
 
-    def main(self, argv):
+    def main(self, argv, testing=False, stdout=sys.stdout):
         """
         Main entry point.
 
@@ -143,9 +144,10 @@ class Salvage(object):
 
         options = self.parser.parse_args(argv)
 
-        self._init_logging(VERBOSITY.get(options.verbosity, 'WARNING'))
+        if not testing:
+            self._init_logging(VERBOSITY.get(options.verbosity, 'WARNING'))
 
-        return options.impl()
+        return options.impl(stdout=stdout)
 
     def _init_logging(self, level):
         config = {
@@ -175,8 +177,8 @@ class Salvage(object):
     # Subcommand implementations
     #
 
-    def split(self):
-        """ Implements the split subcommand. """
+    def new(self, stdout):
+        """ Implements the new subcommand. """
         if options.threshold > options.participants:
             logger.warning("Setting the threshold to {}".format(options.participants))
             options.threshold = options.participants
@@ -186,34 +188,43 @@ class Salvage(object):
 
         if options.verbosity > 0:
             if kit is not None:
-                print("Recovery kit for {} created in {}".format(options.source, options.output))
+                print("Recovery kit for {} created in {}".format(options.source, options.output), file=stdout)
             else:
-                print("Failed to create recovery kit for {}".format(options.source))
+                print("Failed to create recovery kit for {}".format(options.source), file=stdout)
 
         return (0 if (kit is not None) else 1)
 
-    def recover(self):
+    def recover(self, stdout):
         """ Implements the recover subcommand. """
         kit = Kit.load(options.shares)
-        dst_path = os.path.join(options.output, 'salvage-{}'.format(kit.uuid))
 
         if not kit.is_sufficient():
             logger.error("This salvage kit requires {} shares for recovery, but only {} were given.".format(kit.threshold, kit.share_count))
             success = False
+        elif options.no_gpg:
+            master = kit.master_key()
+            success = (master is not None)
+
+            if options.verbosity > 0:
+                if success:
+                    print("GnuPG passphrase for {}: {}".format(Locker.filename, hexlify(master).decode('ascii')), file=stdout)
+                else:
+                    logger.error("Failed to recover the master key.")
         else:
+            dst_path = os.path.join(options.output, 'Salvage data {}'.format(kit.uuid))
             success = kit.unpack(dst_path)
 
-        if options.verbosity > 0:
-            if success:
-                print("Salvage kit successfully recovered to {}".format(dst_path))
-            else:
-                print("Failed to recover salvage kit to {}".format(options.output))
+            if options.verbosity > 0:
+                if success:
+                    print("Salvage kit successfully recovered to {}".format(dst_path), file=stdout)
+                else:
+                    logger.error("Failed to recover salvage kit to {}".format(dst_path))
 
         return (0 if success else 1)
 
-    def test(self):
+    def test(self, stdout):
         """ Implements the test subcommand. """
-        global test_work_path
+        global test_work_path, test_keep_files
 
         self._init_logging('CRITICAL')
 
@@ -221,6 +232,7 @@ class Salvage(object):
             test_work_path = options.working
         else:
             test_work_path = tempfile.mkdtemp()
+        test_keep_files = options.keep_files
 
         # Remove arguments consumed by our ArgumentParser.
         argv = sys.argv[:1] + options.test_args
@@ -286,6 +298,14 @@ class Kit(object):
                 locker = locker.copy(share_path)
             manifest = Manifest.new(kit_uuid, i, locker.mac, shared_key)
             manifest.save(share_path)
+
+            # Copy in some extra information to help with recovery.
+            script_path = os.path.join(share_path, 'salvage.py')
+            shutil.copyfile(__file__, script_path)
+
+            readme_path = os.path.join(share_path, 'README.txt')
+            with open(readme_path, 'w') as f:
+                f.writelines(readme_lines(shared_key))
 
             share = Share.new(share_path, locker, manifest)
             shares.append(share)
@@ -410,7 +430,7 @@ class Kit(object):
         """
         if self.is_sufficient():
             shares = list(self._shares)[:self.threshold]
-            group = tuple(sorted(share.manifest.share_idx for share in shares))
+            group = tuple(sorted(share.manifest.share_index for share in shares))
             key = SplitKey(share.manifest.keys[group] for share in shares).master
         else:
             key = None
@@ -511,7 +531,7 @@ class Share(object):
 
     @property
     def index(self):
-        return self.manifest.share_idx
+        return self.manifest.share_index
 
     #
     # A share is uniquely identified and orderable by Kit uuid and index.
@@ -535,7 +555,7 @@ class Share(object):
     @property
     def _identity(self):
         """ A value uniquely identifying this logical share. """
-        return (self.manifest.uuid, self.manifest.share_idx)
+        return (self.manifest.uuid, self.manifest.share_index)
 
 
 #
@@ -707,7 +727,7 @@ class Manifest(object):
         {
             "version": int,
             "urn": str,
-            "share_idx": int,
+            "share_index": int,
             "mac": str,
             "participants": int,
             "threshold": int,
@@ -720,7 +740,7 @@ class Manifest(object):
     * *version*: The current version is 1.
     * *urn*: Identifies the kit that this share belongs to. In version 1, this
       must be an RFC 4122 UUID.
-    * *share_idx*: The (zero-based) index of this share within its kit.
+    * *share_index*: The (zero-based) index of this share within its kit.
     * *mac*: The hex-encoded SHA-256-HMAC of the unencrypted archive.
     * *participants*: The total number of shares in the kit (n).
     * *threshold*: The number of shares necessary to reconstruct the key (t).
@@ -735,12 +755,12 @@ class Manifest(object):
     filename = 'salvage.json'
 
     @classmethod
-    def new(cls, kit_uuid, share_idx, mac, shared_key):
+    def new(cls, kit_uuid, share_index, mac, shared_key):
         """
         Creates a new manfifest for a share.
 
         :param UUID kit_uuid: The unique identifier for the kit.
-        :param int share_idx: The index of the share that this manifest
+        :param int share_index: The index of the share that this manifest
             describes.
         :param bytes mac: The HMAC of the unencrypted archive.
         :param shared_kay: The shared key for this kit.
@@ -750,12 +770,12 @@ class Manifest(object):
         # This extracts out part of the key for each subgroup. Subgroups that
         # don't include this share are ignored.
         keys = OrderedDict(
-            (idxs, split[idxs.index(share_idx)])
+            (idxs, split[idxs.index(share_index)])
             for idxs, split in shared_key.splits.items()
-            if share_idx in idxs
+            if share_index in idxs
         )
 
-        return cls(1, kit_uuid, share_idx, mac, shared_key.n, shared_key.t, keys)
+        return cls(1, kit_uuid, share_index, mac, shared_key.n, shared_key.t, keys)
 
     @classmethod
     def load(cls, path):
@@ -776,7 +796,7 @@ class Manifest(object):
 
             version = jsonable['version']
             kit_uuid = uuid.UUID(jsonable['urn'])
-            share_idx = jsonable['share_idx']
+            share_index = jsonable['share_index']
             mac = unhexlify(jsonable['mac'].encode('ascii'))
             participants = jsonable['participants']
             threshold = jsonable['threshold']
@@ -787,14 +807,14 @@ class Manifest(object):
         except Exception as e:
             logger.error("Error parsing manifest at {}: {}".format(path, e))
         else:
-            manifest = cls(version, kit_uuid, share_idx, mac, participants, threshold, keys)
+            manifest = cls(version, kit_uuid, share_index, mac, participants, threshold, keys)
 
         return manifest
 
-    def __init__(self, version, kit_uuid, share_idx, mac, participants, threshold, keys):
+    def __init__(self, version, kit_uuid, share_index, mac, participants, threshold, keys):
         self.version = version
         self.uuid = kit_uuid
-        self.share_idx = share_idx
+        self.share_index = share_index
         self.mac = mac
         self.participants = participants
         self.threshold = threshold
@@ -820,7 +840,7 @@ class Manifest(object):
         return OrderedDict([
             ('version', self.version),
             ('urn', self.uuid.urn),
-            ('share_idx', self.share_idx),
+            ('share_index', self.share_index),
             ('mac', hexlify(self.mac).decode('ascii')),
             ('participants', self.participants),
             ('threshold', self.threshold),
@@ -930,7 +950,122 @@ class SplitKey(tuple):
 
 def xor_str(a, b):
     """ Returns the xor of two byte strings. """
-    return b''.join(map(int2byte, [x ^ y for x, y in zip_longest(iterbytes(a), iterbytes(b), fillvalue=int2byte(0))]))
+    return b''.join(map(int2byte, [x ^ y for x, y in zip_longest(iterbytes(a), iterbytes(b), fillvalue=0)]))
+
+
+#
+# Documentation to be bundled in new kits.
+#
+
+def readme_lines(shared_key):
+    return README.format(n=shared_key.n, t=shared_key.t)
+
+
+README = """This folder is one of {n} shares of a salvage kit generated by Salvage
+(https://pypi.python.org/pypi/salvage/). You need at least {t} shares to
+recover the encrypted data. If you have the necessary shares, the included
+script (salvage.py) can be used to recover the data.
+
+
+For Python Users
+----------------
+
+If you're already comforable with Python, here's the short version. Salvage
+requires Python 2.7 or 3.2+. It also requires gpg to be installed; if it's not
+available on your path as 'gpg', use the --gpg option to specify a name or full
+path. See `salvage -h` for more options.
+
+    % pip install salvage
+    % salvage recover path/to/share1 path/to/share2 ...
+
+or
+
+    % python path/to/share1/salvage.py recover ...
+
+
+For OS X Users
+--------------
+
+Unless you're running a very old version of OS X, you already have all of the
+necessary tools installed.
+
+1. The folder that this file lives in is one of {t} "shares" that you need. Copy
+   all {t} shares to your desktop.
+
+2. Open the Terminal application to get a command shell (you can use Cmd-Space to
+   search for it).
+
+3. Run the following commands, replacing 'share1', etc. with the names of the
+   folders you copied in step 3 (don't type the %):
+
+    % cd ~/Desktop
+    % python share1/salvage.py recover share1 share2 ...
+
+This will create a new folder on your desktop with the decrypted data.
+
+
+For Windows Users
+-----------------
+
+1. Download and install Python from https://www.python.org/downloads/. Both Python
+   2 and Python 3 are supported. Make sure the "Add python.exe to Path" option is
+   selected.
+
+2. Download and install GnuPG for Windows from http://gpg4win.org/download.html.
+
+3. The folder that this file lives in is one of {t} "shares" that you need. Copy
+   all {t} shares to your desktop.
+
+4. Open the start menu and enter 'cmd' into the search box. Run this program to
+   get a command shell.
+
+5. Run the following commands, replacing 'share1', etc. with the names of the
+   folders you copied in step 3 (don't type the >):
+
+   > cd Desktop
+   > python share1/salvage.py recover share1 share2 ...
+
+This will create a new folder on your desktop with the decrypted data.
+
+
+For Developers
+--------------
+
+As a last resort, here's a description of how to recover the data manually. You
+can also refer to salvage.py for the source code.
+
+Every share of a salvage kit has an identical locker.tbz.gpg with the encrypted
+data, plus a salvage.json with metadata (aka the manifest). Each copy of the
+manifest contains some common values and some share-specific ones. In
+particular, each one contains the UUID of the salvage kit and the zero-based
+index of that particular share.
+
+1. Examine the manifests in all of the shares you have. Make sure they have the
+   same UUID and different share indexes.
+
+2. Make a note of the share indexes you're working with. For this example,
+   I'll assume that this is a 5-share kit with the threshold of 3 and that
+   you have shares 0, 2, and 3. This is your group.
+
+3. Each manifest has a table of key material of the form [group, key] items.
+   Find the one with your group of shares, e.g. [0, 2, 3]. Each of your
+   manifests should have this row in the key table with a different value.
+   These are your keys.
+
+4. Convert each key to its binary form (Python: binascii.unhexlify(key)).
+   Combine the three keys by xor-ing the bytes. This is your master key.
+
+5. Convert the master key to its hex representation (e.g. 01234567). This
+   is your passphrase.
+
+6. Run `gpg locker.tbz.gpg` and enter the passhprase when it asks. Or run
+   `gpg --batch --passphrase <passphrase> locker.tbz.gpg`.
+
+You should now have the decrypted data in the form of locker.tbz (a tar/bzip2
+archive). For extra credit, you can verify the signature: use the master key
+from step 4 to compute the SHA-256-HMAC of locker.tbz. The correct value is
+included in each manifest under the key "mac".
+"""
 
 
 #
@@ -941,6 +1076,8 @@ PY2 = (sys.version_info[0] == 2)
 PY3 = (sys.version_info[0] == 3)
 
 if PY3:
+    from io import StringIO
+
     iterbytes = iter
     if sys.version_info[1] <= 1:
         int2byte = lambda i: bytes((i,))
@@ -949,6 +1086,8 @@ if PY3:
         int2byte = operator.methodcaller("to_bytes", 1, "big")
     zip_longest = itertools.zip_longest
 else:
+    from StringIO import StringIO
+
     iterbytes = functools.partial(itertools.imap, ord)
     int2byte = chr
     zip_longest = itertools.izip_longest
@@ -968,7 +1107,7 @@ class BaseTestCase(unittest.TestCase):
         super(BaseTestCase, self).setUp()
 
     def tearDown(self):
-        if (not options.keep_files) and (self._tempdir is not None):
+        if (not test_keep_files) and (self._tempdir is not None):
             shutil.rmtree(self._tempdir)
         self._tempdir = None
 
@@ -1142,12 +1281,14 @@ class ManifestTestCase(BaseTestCase):
         self.assertTrue(os.path.isfile(self.work_path(Manifest.filename)))
 
     def test_roundtrip(self):
+        """ Load an existing manifest. """
         self.manifest.save(self.work_path())
         manifest = Manifest.load(self.work_path(Manifest.filename))
 
         self.assertManifestContent(manifest)
 
     def test_missing_key(self):
+        """ Try to load an incomplete manifest. """
         jsonable = self.manifest.to_jsonable()
         del jsonable['version']
         with open(self.work_path(Manifest.filename), 'w') as f:
@@ -1161,7 +1302,7 @@ class ManifestTestCase(BaseTestCase):
         """ Asserts the properties of our standard test manifest. """
         self.assertEqual(manifest.version, 1)
         self.assertEqual(manifest.uuid, self.uuid)
-        self.assertEqual(manifest.share_idx, 1)
+        self.assertEqual(manifest.share_index, 1)
         self.assertEqual(manifest.mac, b'test-mac')
         self.assertEqual(manifest.participants, 3)
         self.assertEqual(manifest.threshold, 2)
@@ -1173,11 +1314,13 @@ class ManifestTestCase(BaseTestCase):
 
 class ShareTestCase(BaseTestCase):
     def test_bad_share(self):
+        """ Try to load a share with data missing. """
         share = Share.load(self.tempdir)
 
         self.assertTrue(share is None)
 
     def test_share_init(self):
+        """ Test share init edge cases. """
         locker = Locker.create(self.tempdir, self.content_path(), b'01234567')
         manifest = Manifest.new(uuid.uuid1(), 1, b'test-mac', SharedKey(3, 2, b'01234567'))
 
@@ -1201,6 +1344,7 @@ class KitTestCase(BaseTestCase):
         super(KitTestCase, cls).tearDownClass()
 
     def test_create(self):
+        """ Create a new salvage kit. """
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
@@ -1211,8 +1355,11 @@ class KitTestCase(BaseTestCase):
             else:
                 self.assertTrue(Locker.filename in filenames)
                 self.assertTrue(Manifest.filename in filenames)
+                self.assertTrue('salvage.py' in filenames)
+                self.assertTrue('README.txt' in filenames)
 
     def test_collision(self):
+        """ Try to create a kit with an existing file in the way. """
         kit_path = self.work_path('kit', True)
         share_path = self.work_path('kit/salvage-share-1')
         with open(share_path, 'w'):
@@ -1223,6 +1370,7 @@ class KitTestCase(BaseTestCase):
         self.assertTrue(kit is None)
 
     def test_load(self):
+        """ Load an existing complete kit. """
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
@@ -1232,6 +1380,7 @@ class KitTestCase(BaseTestCase):
         self.assertTrue(kit.is_sufficient())
 
     def test_sufficient(self):
+        """ Load a partial but sufficient kit. """
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
@@ -1247,6 +1396,7 @@ class KitTestCase(BaseTestCase):
         self.assertTrue(kit.is_sufficient())
 
     def test_roundtrip(self):
+        """ Unpack an existing kit. """
         kit_path = self.work_path('kit', True)
 
         kit = Kit.create(kit_path, self.content_path(), self.key)
@@ -1256,12 +1406,14 @@ class KitTestCase(BaseTestCase):
             self.assertEqual(f.read(), b'testing')
 
     def test_share_ordering(self):
+        """ Test the ordering properties of shares. """
         kit = Kit.create(self.work_path('kit', True), self.content_path(), self.key)
 
         self.assertEqual([share.index for share in kit.shares], list(range(self.key.n)))
         self.assertEqual(kit.shares[0], kit.shares[0])
 
     def test_incremental(self):
+        """ Build a kit by adding and removing shares incrementally. """
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
@@ -1285,6 +1437,7 @@ class KitTestCase(BaseTestCase):
         self.assertEqual(kit.share_count, self.key.n - 2)
 
     def test_mismatched_share(self):
+        """ Try to load a kit from mismatched shares. """
         kit1_path = self.work_path('kit1', True)
         kit2_path = self.work_path('kit2', True)
 
@@ -1299,6 +1452,7 @@ class KitTestCase(BaseTestCase):
         self.assertFalse(success2)
 
     def test_insufficient(self):
+        """ Try to unpack a kit with insufficient shares. """
         kit_path = self.work_path('kit', True)
 
         Kit.create(kit_path, self.content_path(), self.key)
@@ -1316,18 +1470,144 @@ class KitTestCase(BaseTestCase):
 
 
 class SalvageTestCase(BaseTestCase):
-    def _test_split(self):
+    def setUp(self):
+        super(SalvageTestCase, self).setUp()
+
+        self.stdout = StringIO()
+
+    def tearDown(self):
+        del self.stdout
+
+        super(SalvageTestCase, self).tearDown()
+
+    def test_gte2_arg(self):
+        """ Test parsing int arguments that must be at least 2. """
+        two = Salvage()._at_least_2('2')
+
+        self.assertEqual(two, 2)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            Salvage()._at_least_2('bogus')
+        with self.assertRaises(argparse.ArgumentTypeError):
+            Salvage()._at_least_2('1')
+
+    def test_path_arg(self):
+        """ Test parsing path arguments. """
+        noexist = self.work_path('noexist')
+
+        self.assertEqual(Salvage()._path()(self.tempdir), self.tempdir)
+        self.assertEqual(Salvage()._path(True)(self.tempdir), self.tempdir)
+        self.assertEqual(Salvage()._path()(noexist), noexist)
+        with self.assertRaises(argparse.ArgumentTypeError):
+            Salvage()._path(True)(noexist)
+
+    def test_new(self):
+        """ Crate a new kit. """
         src_path = self.content_path()
         kit_path = self.tempdir
 
-        Salvage().main(['-o', kit_path, 'split', '-n', '3', '-t', '2', src_path])
+        rc = self.main(['-o', kit_path, 'new', '3', '2', src_path])
 
         kit = Kit.load(
             os.path.join(kit_path, share_dir)
             for share_dir in os.listdir(kit_path)
         )
 
+        self.assertEqual(rc, 0)
         self.assertTrue(kit.is_complete())
+
+    def test_new_threshold_cap(self):
+        """ Constrain the threshold to the participant count. """
+        src_path = self.content_path()
+        kit_path = self.tempdir
+
+        rc = self.main(['-o', kit_path, 'new', '3', '5', src_path])
+
+        kit = Kit.load(
+            os.path.join(kit_path, share_dir)
+            for share_dir in os.listdir(kit_path)
+        )
+
+        self.assertEqual(rc, 0)
+        self.assertTrue(kit.is_complete())
+
+    def test_recover(self):
+        """ Recover the data from a kit. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
+
+        rc = self.main(['-o', out_path, 'recover'] + share_paths)
+
+        self.assertEqual(rc, 0)
+        data_path = os.path.join(out_path, os.listdir(out_path)[0])
+        with open(os.path.join(data_path, 'content/secrets.txt'), 'rb') as f:
+            self.assertEqual(f.read(), b'testing')
+
+    def test_recover_no_gpg(self):
+        """ Recover the key from a kit, but don't run gpg. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
+
+        rc = self.main(['--gpg', 'bogus', '-o', out_path, 'recover', '--no-gpg'] + share_paths)
+
+        self.assertEqual(rc, 0)
+
+    def test_recover_insufficient(self):
+        """ Try to recover with insufficient shares. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)[:2]]
+
+        rc = self.main(['-o', out_path, 'recover', '--no-gpg'] + share_paths)
+
+        self.assertNotEqual(rc, 0)
+
+    def test_recover_duplicate(self):
+        """ Try to recover with duplicate shares. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)[:2] * 2]
+
+        rc = self.main(['-o', out_path, 'recover', '--no-gpg'] + share_paths)
+
+        self.assertNotEqual(rc, 0)
+
+    def test_recover_broken(self):
+        """ Try to recover a kit with broken mac values. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        kit = Kit.create(kit_path, src_path, SharedKey(5, 3))
+        for share in kit.shares:
+            share.manifest.mac = xor_str(share.manifest.mac, b'\1')
+            share.manifest.save(share.path)
+        share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
+
+        rc = self.main(['-o', out_path, 'recover'] + share_paths)
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(os.listdir(out_path), [])
+
+    #
+    # Utils
+    #
+
+    def main(self, argv):
+        return Salvage().main(argv, testing=True, stdout=self.stdout)
 
 
 #
