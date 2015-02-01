@@ -5,7 +5,7 @@ from setuptools import setup
 
 setup(
     name='salvage',
-    version='0.1.0',
+    version='0.1.1',
     description='Allows a group of people to hold sensitive information using a simple secret-splitting scheme.',
     long_description=open('README.rst').read(),
     author='Peter Sagerson',
