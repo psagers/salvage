@@ -9,7 +9,7 @@ Salvage works by encrypting a file or directory with a random master key and
 then applying a simple key-splitting scheme to distribute the key across
 multiple shares. You can create a kit for any number of participants with any
 threshold required to recover the information. For example, you might create a
-kit for five people, any three of which may combine their shares to recover the
+kit for five people, any three of whom may combine their shares to recover the
 data.
 
 Salvage runs under Python 2.7 or Python 3.2 and later. The only external
@@ -32,7 +32,8 @@ any Python packages.
 Quick Start
 -----------
 
-To create a new salvage kit for five participants with a threshold of three:
+To create a new salvage kit for five participants with a recovery threshold of
+three:
 
     ``% salvage new 5 3 path/to/source/dir``
 
