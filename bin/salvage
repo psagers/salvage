@@ -60,7 +60,7 @@ test_keep_files = False
 
 
 #
-# The command processor.
+# The command processor
 #
 
 class Salvage(object):
@@ -77,25 +77,35 @@ class Salvage(object):
     def _init_arg_parser(self):
         """ Initializes our ArgumentParser. """
         parser = argparse.ArgumentParser()
-        parser.add_argument('-o', '--output', type=self._path(True), default=os.getcwd(), help="the output directory [%(default)s]")
-        parser.add_argument('--gpg', default='gpg', help="name or path of your gpg executable [%(default)s]")
-        parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=2, help="verbosity level (0-4) [%(default)s]")
+        parser.add_argument('--gpg', default='gpg', help="Name or path of your gpg executable [%(default)s].")
+        parser.add_argument('-v', '--verbosity', type=int, choices=sorted(VERBOSITY.keys()), default=2, help="Verbosity level [%(default)s].")
         sub = parser.add_subparsers(title="commands", dest='action')
 
-        new_parser = sub.add_parser('new', help="create a new salvate kit from a source file or directory")
-        new_parser.add_argument('participants', type=self._at_least_2, help="the total number of participants")
-        new_parser.add_argument('threshold', type=self._at_least_2, help="the number required to recover the data")
-        new_parser.add_argument('source', type=self._path(True), help="the file or directory to protect")
+        new_parser = sub.add_parser(
+            'new',
+            help="Create a new salvate kit from a source file or directory.",
+            description="Protect sensitive data by encrypting it and splitting the key across a group of participants."
+        )
+        new_parser.add_argument('-o', '--output', type=self._path(True), default=os.getcwd(), help="The output directory [.].")
+        new_parser.add_argument('participants', type=self._at_least_2, help="The total number of participants.")
+        new_parser.add_argument('threshold', type=self._at_least_2, help="The number required to recover the data.")
+        new_parser.add_argument('source', type=self._path(True), help="The file or directory to protect.")
         new_parser.set_defaults(impl=self.new)
 
-        recover_parser = sub.add_parser('recover', help="recover an encrypted item using the reunited shares")
-        recover_parser.add_argument('--no-gpg', action='store_true', help="don't decrypt the data, just recover the key")
-        recover_parser.add_argument('shares', nargs='+', type=self._path(True), help="directories previously created by `salvage new`")
+        recover_parser = sub.add_parser(
+            'recover',
+            help="Recover an encrypted archive using the reunited shares.",
+            description="Recover data previously protected by salvage. This requires a sufficient number of the original shares.",
+        )
+        recover_parser.add_argument('--no-gpg', action='store_true', help="Don't decrypt the data, just recover the key.")
+        recover_parser.add_argument('-o', '--output', type=self._path(True), default=os.getcwd(), help="The output directory [.].")
+        recover_parser.add_argument('-a', '--all', action='store_true', help="Treat the arguments as directories to search for shares. Searches the current directory by default.")
+        recover_parser.add_argument('shares', nargs='*', type=self._path(True), metavar='path', help="Directories previously created by `salvage new`.")
         recover_parser.set_defaults(impl=self.recover)
 
-        test_parser = sub.add_parser('test', help="run unit tests")
-        test_parser.add_argument('-w', '--working', type=self._path(True), default=None, help="working directory for tests")
-        test_parser.add_argument('-k', '--keep-files', action='store_true', help="don't clean up test-generated files")
+        test_parser = sub.add_parser('test', help="Run unit tests.")
+        test_parser.add_argument('-w', '--working', type=self._path(True), default=None, help="Working directory for tests.")
+        test_parser.add_argument('-k', '--keep-files', action='store_true', help="Don't clean up test-generated files.")
         test_parser.add_argument('test_args', nargs=argparse.REMAINDER)
         test_parser.set_defaults(impl=self.test)
 
@@ -196,9 +206,17 @@ class Salvage(object):
 
     def recover(self, stdout):
         """ Implements the recover subcommand. """
-        kit = Kit.load(options.shares)
+        if options.all:
+            paths = self._find_shares(options.shares)
+        else:
+            paths = options.shares
 
-        if not kit.is_sufficient():
+        kit = Kit.load(paths)
+
+        if kit.share_count == 0:
+            logger.warning("No shares {}. Nothing to do.".format('found' if options.all else 'given'))
+            success = False
+        elif not kit.is_sufficient():
             logger.error("This salvage kit requires {} shares for recovery, but only {} were given.".format(kit.threshold, kit.share_count))
             success = False
         elif options.no_gpg:
@@ -242,6 +260,26 @@ class Salvage(object):
         # Clean up the temp directory if it didn't come from the user.
         if options.working is None:
             shutil.rmtree(test_work_path)
+
+    #
+    # Helpers
+    #
+
+    def _find_shares(self, paths):
+        """
+        Searches the given paths for valid shares and generates paths to them.
+
+        If paths is empty or None, this looks in the current directory.
+
+        """
+        if not paths:
+            paths = [os.getcwd()]
+
+        for path in paths:
+            for dirname in os.listdir(path):
+                candidate = os.path.join(path, dirname)
+                if os.path.exists(os.path.join(candidate, Manifest.filename)):
+                    yield candidate
 
 
 #
@@ -391,20 +429,15 @@ class Kit(object):
 
     def is_complete(self):
         """ Returns True iff all shares are present. """
-        return (len(self._shares) == self.participants)
+        return (self.participants > 0) and (len(self._shares) == self.participants)
 
     def is_sufficient(self):
         """ Returns True iff enough shares are present for the threshold. """
-        return (len(self._shares) >= self.threshold)
+        return (self.threshold > 0) and (len(self._shares) >= self.threshold)
 
     #
     # Recovery
     #
-
-    def validate(self):
-        """
-        Generates warnings or errors if any shares are invalid or inconsistent.
-        """
 
     def unpack(self, dst_path):
         """
@@ -451,11 +484,11 @@ class Kit(object):
 
     @property
     def participants(self):
-        return (self.any_share.manifest.participants if self._shares else None)
+        return (self.any_share.manifest.participants if self._shares else 0)
 
     @property
     def threshold(self):
-        return (self.any_share.manifest.threshold if self._shares else None)
+        return (self.any_share.manifest.threshold if self._shares else 0)
 
     @property
     def mac(self):
@@ -482,9 +515,12 @@ class Share(object):
         """
         Creates a new share.
 
+        The caller should have already copied the locker and manifest into
+        place on disk.
+
         :param str path: The path of the new share.
-        :param Locker locker: The locker to copy in.
-        :param Manifest manifest: The manifest to copy in.
+        :param Locker locker: The locker.
+        :param Manifest manifest: The manifest.
 
         """
         return cls(path, locker, manifest)
@@ -989,17 +1025,17 @@ For OS X Users
 Unless you're running a very old version of OS X, you already have all of the
 necessary tools installed.
 
-1. The folder that this file lives in is one of {t} "shares" that you need. Copy
-   all {t} shares to your desktop.
+1. The folder that this file lives in is one of {t} "shares" that you need.
+   Copy all {t} shares to your desktop.
 
-2. Open the Terminal application to get a command shell (you can use Cmd-Space to
-   search for Terminal).
+2. Open the Terminal application to get a command shell (you can use Cmd-Space
+   to search for Terminal).
 
-3. Run the following commands, replacing 'share1', etc. with the names of the
+3. Run the following commands, replacing <share1> with the name of one of the
    folders you copied in step 3 (don't type the %):
 
-    % cd ~/Desktop
-    % python share1/salvage.py recover share1 share2 ...
+    % cd Desktop
+    % python <share1>/salvage.py recover -a
 
 This will create a new folder on your desktop with the decrypted data.
 
@@ -1007,23 +1043,23 @@ This will create a new folder on your desktop with the decrypted data.
 For Windows Users
 -----------------
 
-1. Download and install Python from https://www.python.org/downloads/. Both Python
-   2 and Python 3 are supported. Make sure the "Add python.exe to Path" option is
-   selected.
+1. Download and install Python from https://www.python.org/downloads/. Both
+   Python 2 and Python 3 are supported. Make sure the "Add python.exe to Path"
+   option is selected.
 
 2. Download and install GnuPG for Windows from http://gpg4win.org/download.html.
 
-3. The folder that this file lives in is one of {t} "shares" that you need. Copy
-   all {t} shares to your desktop.
+3. The folder that this file lives in is one of {t} "shares" that you need.
+   Copy all {t} shares to your desktop.
 
 4. Open the start menu and enter 'cmd' into the search box. Run this program to
    get a command shell.
 
-5. Run the following commands, replacing 'share1', etc. with the names of the
+5. Run the following commands, replacing <share1> with the name of one of the
    folders you copied in step 3 (don't type the >):
 
    > cd Desktop
-   > python share1/salvage.py recover share1 share2 ...
+   > python <share1>/salvage.py recover -a
 
 This will create a new folder on your desktop with the decrypted data.
 
@@ -1154,6 +1190,22 @@ class BaseTestCase(unittest.TestCase):
             name = None
 
         return name
+
+    class cwd(object):
+        """ Context processor that pushes a working directory. """
+        def __init__(self, path):
+            self.original = None
+            self.path = path
+
+        def __enter__(self):
+            self.original = os.getcwd()
+            os.chdir(self.path)
+
+            return self
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            os.chdir(self.original)
+            self.original = None
 
 
 class SharedKeyTestCase(BaseTestCase):
@@ -1379,6 +1431,21 @@ class KitTestCase(BaseTestCase):
         self.assertTrue(kit.is_complete())
         self.assertTrue(kit.is_sufficient())
 
+    def test_empty(self):
+        """ Test the properties of an empty kit. """
+        kit = Kit()
+
+        self.assertFalse(kit.is_complete())
+        self.assertFalse(kit.is_sufficient())
+        self.assertFalse(kit.unpack('.'))
+        self.assertEqual(kit.master_key(), None)
+        self.assertEqual(kit.locker, None)
+        self.assertEqual(kit.uuid, None)
+        self.assertEqual(kit.participants, 0)
+        self.assertEqual(kit.threshold, 0)
+        self.assertEqual(kit.mac, None)
+        self.assertEqual(kit.any_share, None)
+
     def test_sufficient(self):
         """ Load a partial but sufficient kit. """
         kit_path = self.work_path('kit', True)
@@ -1505,7 +1572,7 @@ class SalvageTestCase(BaseTestCase):
         src_path = self.content_path()
         kit_path = self.tempdir
 
-        rc = self.main(['-o', kit_path, 'new', '3', '2', src_path])
+        rc = self.main(['new', '-o', kit_path, '3', '2', src_path])
 
         kit = Kit.load(
             os.path.join(kit_path, share_dir)
@@ -1520,7 +1587,7 @@ class SalvageTestCase(BaseTestCase):
         src_path = self.content_path()
         kit_path = self.tempdir
 
-        rc = self.main(['-o', kit_path, 'new', '3', '5', src_path])
+        rc = self.main(['new', '-o', kit_path, '3', '5', src_path])
 
         kit = Kit.load(
             os.path.join(kit_path, share_dir)
@@ -1539,7 +1606,74 @@ class SalvageTestCase(BaseTestCase):
         Kit.create(kit_path, src_path, SharedKey(5, 3))
         share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
 
-        rc = self.main(['-o', out_path, 'recover'] + share_paths)
+        rc = self.main(['recover', '-o', out_path] + share_paths)
+
+        self.assertEqual(rc, 0)
+        data_path = os.path.join(out_path, os.listdir(out_path)[0])
+        with open(os.path.join(data_path, 'content/secrets.txt'), 'rb') as f:
+            self.assertEqual(f.read(), b'testing')
+
+    def test_recover_none(self):
+        out_path = self.work_path('out', True)
+
+        rc = self.main(['recover', '-o', out_path])
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(os.listdir(out_path), [])
+
+    def test_recover_none_cwd(self):
+        out_path = self.work_path('out', True)
+
+        with self.cwd(out_path):
+            rc = self.main(['recover', '-a'])
+
+        self.assertNotEqual(rc, 0)
+        self.assertEqual(os.listdir(out_path), [])
+
+    def test_recover_all(self):
+        """ Recover the data from a kit. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        os.mkdir(os.path.join(kit_path, 'random_dir'))
+        with open(os.path.join(kit_path, 'random_file'), 'w') as f:
+            pass
+
+        rc = self.main(['recover', '-o', out_path, '-a', kit_path])
+
+        self.assertEqual(rc, 0)
+        data_path = os.path.join(out_path, os.listdir(out_path)[0])
+        with open(os.path.join(data_path, 'content/secrets.txt'), 'rb') as f:
+            self.assertEqual(f.read(), b'testing')
+
+    def test_recover_all_cwd(self):
+        """ Recover the data from a kit. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+
+        with self.cwd(kit_path):
+            rc = self.main(['recover', '-o', out_path, '-a'])
+
+        self.assertEqual(rc, 0)
+        data_path = os.path.join(out_path, os.listdir(out_path)[0])
+        with open(os.path.join(data_path, 'content/secrets.txt'), 'rb') as f:
+            self.assertEqual(f.read(), b'testing')
+
+    def test_recover_to_cwd(self):
+        """ Recover the data from a kit. """
+        src_path = self.content_path()
+        kit_path = self.work_path('kit', True)
+        out_path = self.work_path('out', True)
+
+        Kit.create(kit_path, src_path, SharedKey(5, 3))
+
+        with self.cwd(out_path):
+            rc = self.main(['recover', '-a', kit_path])
 
         self.assertEqual(rc, 0)
         data_path = os.path.join(out_path, os.listdir(out_path)[0])
@@ -1552,12 +1686,14 @@ class SalvageTestCase(BaseTestCase):
         kit_path = self.work_path('kit', True)
         out_path = self.work_path('out', True)
 
-        Kit.create(kit_path, src_path, SharedKey(5, 3))
+        Kit.create(kit_path, src_path, SharedKey(5, 3, master=b'\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f'))
         share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
 
-        rc = self.main(['--gpg', 'bogus', '-o', out_path, 'recover', '--no-gpg'] + share_paths)
+        rc = self.main(['--gpg', 'bogus', 'recover', '--no-gpg', '-o', out_path] + share_paths)
 
         self.assertEqual(rc, 0)
+        self.assertTrue('000102030405060708090a0b0c0d0e0f' in self.stdout.getvalue().lower())
+        self.assertEqual(os.listdir(out_path), [])
 
     def test_recover_insufficient(self):
         """ Try to recover with insufficient shares. """
@@ -1568,9 +1704,10 @@ class SalvageTestCase(BaseTestCase):
         Kit.create(kit_path, src_path, SharedKey(5, 3))
         share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)[:2]]
 
-        rc = self.main(['-o', out_path, 'recover', '--no-gpg'] + share_paths)
+        rc = self.main(['recover', '--no-gpg', '-o', out_path] + share_paths)
 
         self.assertNotEqual(rc, 0)
+        self.assertEqual(os.listdir(out_path), [])
 
     def test_recover_duplicate(self):
         """ Try to recover with duplicate shares. """
@@ -1581,7 +1718,7 @@ class SalvageTestCase(BaseTestCase):
         Kit.create(kit_path, src_path, SharedKey(5, 3))
         share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)[:2] * 2]
 
-        rc = self.main(['-o', out_path, 'recover', '--no-gpg'] + share_paths)
+        rc = self.main(['recover', '--no-gpg', '-o', out_path] + share_paths)
 
         self.assertNotEqual(rc, 0)
 
@@ -1597,7 +1734,7 @@ class SalvageTestCase(BaseTestCase):
             share.manifest.save(share.path)
         share_paths = [os.path.join(kit_path, share_path) for share_path in os.listdir(kit_path)]
 
-        rc = self.main(['-o', out_path, 'recover'] + share_paths)
+        rc = self.main(['recover', '-o', out_path] + share_paths)
 
         self.assertNotEqual(rc, 0)
         self.assertEqual(os.listdir(out_path), [])

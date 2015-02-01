@@ -34,12 +34,12 @@ Quick Start
 
 To create a new salvage kit for five participants with a threshold of three:
 
-    ``$ salvage new 5 3 path/to/source/dir``
+    ``% salvage new 5 3 path/to/source/dir``
 
 This will create five shares, each containing an encrypted archive and some
 metadata. To decrypt and unpack the archive:
 
-    ``$ salvage recover path/to/share1 path/to/share2 path/to/share3``
+    ``% salvage recover path/to/share1 path/to/share2 path/to/share3``
 
 The three paths must be three of the shares generated in the first step. The
 master key will be reconstructed and the data will be decrypted and unpacked.
