@@ -4,27 +4,38 @@ Salvage
 .. include:: ../../README.rst
 
 
-Practical Use
--------------
+Choosing Parameters
+-------------------
 
 Salvage is designed to accomplish two somewhat competing goals: to minimize the
-risk of both disclosing and losing some piece of information. The risks can
-never be entirely eliminated, but there are several things that can be done to
-further reduce them.
+risk both of disclosing and of losing some piece of information. The risk of
+accidental disclosure :math:`p_{disc}` can be calculated as :math:`1 - (1 -
+p^t)^\binom{n}{t}` where :math:`n` is the number of participants, :math:`t` is
+the recovery threshold, and :math:`p` is the probability of any given share
+being disclosed. Substitute :math:`t' = n - t + 1` for :math:`t` to calculate
+the risk of irretrievable data loss :math:`p_{loss}` (where :math:`p` is now the
+probability of a share being lost).
 
-To start with, you have to decide how many shares to create and how many are
-required for recovery. More total shares will reduce the risk of loss but
-slightly increase the risk of disclosure. A higher recovery threshold will do
-the opposite.
+High ratios of :math:`n/t` will give you a very low :math:`p_{loss}`, but
+:math:`p_{disc}` could easily exceed :math:`p` itself. Very low ratios of
+:math:`n/t` will do the reverse. Unless you're far more concerned with one over
+the other, :math:`t` should probably be 40-60% of :math:`n`.
 
 
-Disclosure
-~~~~~~~~~~
+Practical Considerations
+------------------------
+
+The risks of disclosure and loss can never be entirely eliminated, but there are
+several things that can be done to further reduce them.
+
+
+Avoiding Disclosure
+~~~~~~~~~~~~~~~~~~~
 
 This is the easier one, as all of the usual rules apply. Each share of a salvage
 kit should be handled as if it were the raw data. Ideally, it will only exist on
 physical media and be stored like any other valuable and sensitive document. You
-can alway apply extra protection to each share, such as encrypting it with the
+can always apply extra protection to each share, such as encrypting it with the
 public key of the intended recipient.
 
 Depending on your level of paranoia, you might also give some thought to how you
@@ -41,8 +52,8 @@ Consider where these are being written and try to separate them as soon as
 possible.
 
 
-Loss
-~~~~
+Avoiding Loss
+~~~~~~~~~~~~~
 
 Salvage itself takes several steps to minimize the risk that a kit will become
 unrecoverable:
@@ -81,8 +92,8 @@ data loss:
   especially technical).
 
 
-Details
--------
+Technical Details
+-----------------
 
 This section has a quick technical description of how salvage works. The
 cryptography involved is pretty trivial, so the bulk of the code is concerned
@@ -91,8 +102,8 @@ create a new salvage kit. This is for a kit with ``n`` participants and a
 threshold of ``t``.
 
 #. The source data is archived, compressed, and encrypted with a random 128-bit
-   key. We also use the key to generate a SHA-256-HMAC of the unencrypted
-   archive.
+   key (rendered to a string for `gpg`_). We also use the key to generate a
+   SHA-256-HMAC of the unencrypted archive.
 
 #. For every unique set of ``t`` participants (``n choose t``), ``t - 1`` random
    keys are generated. These are combined with the master key by xoring the
