@@ -8,18 +8,63 @@ Choosing Parameters
 -------------------
 
 Salvage is designed to accomplish two somewhat competing goals: to minimize the
-risk both of disclosing and of losing some piece of information. The risk of
-accidental disclosure :math:`p_{disc}` can be calculated as :math:`1 - (1 -
-p^t)^\binom{n}{t}` where :math:`n` is the number of participants, :math:`t` is
-the recovery threshold, and :math:`p` is the probability of any given share
-being disclosed. Substitute :math:`t' = n - t + 1` for :math:`t` to calculate
-the risk of irretrievable data loss :math:`p_{loss}` (where :math:`p` is now the
-probability of a share being lost).
+risk both of disclosing and of losing some data. Given:
 
-High ratios of :math:`n/t` will give you a very low :math:`p_{loss}`, but
-:math:`p_{disc}` could easily exceed :math:`p` itself. Very low ratios of
-:math:`n/t` will do the reverse. Unless you're far more concerned with one over
-the other, :math:`t` should probably be 40-60% of :math:`n`.
+    * :math:`n \equiv` the total number of participants or shares.
+    * :math:`t \equiv` the number of shares required to recover the data (the
+      threshold).
+    * :math:`t' = n - t + 1 \equiv` the number of shares that must be lost to
+      lose the data.
+    * :math:`p_d \equiv` the chance of disclosing any given share.
+    * :math:`p_l \equiv` the chance of losing any given share.
+
+We can calculate the chances of disclosure or loss of the original data as:
+
+    * :math:`p_{disc} = 1 - (1 - p_d^t)^\binom{n}{t}`
+    * :math:`p_{loss} = 1 - (1 - p_l^{t'})^\binom{n}{t'}`
+
+High values of :math:`t` will give you a very low :math:`p_{loss}`, but
+:math:`p_{disc}` could easily exceed :math:`p_d` itself. Very low values of
+:math:`t` will do the reverse. Unless you're far more concerned with one over
+the other, :math:`t` should typically be 40-60% of :math:`n`.
+
+
+Calculator
+~~~~~~~~~~
+
+.. raw:: html
+
+    <table id="parameters">
+        <tbody>
+            <tr>
+                <td>Participants:</td>
+                <td><span id="n-display"></span></td>
+                <td><div id="n-slider"></div></td>
+            </tr>
+            <tr>
+                <td>Threshold:</td>
+                <td><span id="t-display"></span></td>
+                <td><div id="t-slider"></div></td>
+            </tr>
+        </tbody>
+    </table>
+
+    <table id="probabilities">
+        <tbody>
+            <tr>
+                <td><label for="p_d">Chance of disclosing one share:</label></td>
+                <td><input id="p_d" name="p_d"></input> %</td>
+                <td>Chance of disclosing secure data:</td>
+                <td><span id="p_disc"></span>%</td>
+            </tr>
+            <tr>
+                <td><label for="p_l">Chance of losing one share:</label></td>
+                <td><input id="p_l" name="p_l"></input> %</td>
+                <td>Chance of losing secure data:</td>
+                <td><span id="p_loss"></span>%</td>
+            </tr>
+        </tbody>
+    </table>
 
 
 Practical Considerations
@@ -76,7 +121,7 @@ data loss:
 * Store the data well. No digital media lasts forever, but do some research on
   the current state of the art. If burning to optical media, buy high quality
   media designed for archiving. It's also a good idea to print everything out on
-  acid-free paper. Ink on paper lasts quite a while and OCR scanners are easy to
+  acid-free paper. Ink on paper lasts a long time and OCR scanners are easy to
   come by.
 
 * Refresh salvage kits periodically. Consider how long your storage media is
@@ -97,31 +142,30 @@ Technical Details
 
 This section has a quick technical description of how salvage works. The
 cryptography involved is pretty trivial, so the bulk of the code is concerned
-with packaging and logistics. Following is the general procedure followed to
-create a new salvage kit. This is for a kit with ``n`` participants and a
-threshold of ``t``.
+with packaging and logistics. Following is the general procedure used to create
+a new salvage kit with :math:`n` participants and a threshold of :math:`t`.
 
 #. The source data is archived, compressed, and encrypted with a random 128-bit
    key (rendered to a string for `gpg`_). We also use the key to generate a
    SHA-256-HMAC of the unencrypted archive.
 
-#. For every unique set of ``t`` participants (``n choose t``), ``t - 1`` random
-   keys are generated. These are combined with the master key by xoring the
-   bytes to produce a final random key. We now have ``t`` partial keys that xor
-   to the master key. This can be visualized as a partially filled table of key
-   material, one row for each ``t``-sized subset of ``n`` and one column for
-   each participant (``[0-n}``). The values in each row xor to the same master
-   key.
+#. For every unique set of :math:`t` participants (of which there are
+   :math:`\binom{n}{t}`), :math:`t - 1` random keys are generated. These are
+   combined with the master key by xoring the bytes to produce a final random
+   key. We now have :math:`t` partial keys that xor to the master key. This can
+   be visualized as a partially filled table of key material, one row for each
+   :math:`t`-sized subset of :math:`n` and one column for each participant
+   :math:`[0,n)`. The values in each row xor to the same master key.
 
-#. ``n`` directories are created, each representing one share. Each share gets
-   its own identical copy of the encrypted archive, plus some metadata in a json
-   file. The metadata includes:
+#. :math:`n` directories are created, each representing one share. Each share
+   gets its own identical copy of the encrypted archive, plus some metadata in a
+   json file. The metadata includes:
 
    * A version.
    * A common UUID identifying the kit as a whole.
    * The index of that particular share.
    * The HMAC value.
-   * The values of ``n`` and ``t``.
+   * The values of :math:`n` and :math:`t`.
    * A table of key material.
 
    The key material is essentially one column of the full key table: all of the
@@ -129,8 +173,8 @@ threshold of ``t``.
    words, it says "to combine shares 0, 1, and 2, use k1; else to combine shares
    0, 1, and 3, use k2; ...".
 
-When ``t`` shares are brought together, one row of the key table can be fully
-reassembled, which means the master key can be recovered and the archive
+When :math:`t` shares are brought together, one row of the key table can be
+fully reassembled, which means the master key can be recovered and the archive
 decrypted.
 
 
