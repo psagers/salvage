@@ -1,7 +1,7 @@
 Salvage distributes sensitive data to multiple people such that it can only be
 recovered by several people working together. This is useful for storing
 information with both a low risk of losing access to it and a low risk of
-accidental exposure. A classic application is to create a "recovery kit" for a
+accidental disclosure. A classic application is to create a "recovery kit" for a
 server or infrastructure, which can be used in the event that conventionally
 stored keys and credentials become lost or unavailable.
 
