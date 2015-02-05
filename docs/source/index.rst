@@ -23,8 +23,8 @@ We can calculate the chances of disclosure or loss of the original data as:
     * :math:`p_{disc} = 1 - (1 - p_d^t)^\binom{n}{t}`
     * :math:`p_{loss} = 1 - (1 - p_l^{t'})^\binom{n}{t'}`
 
-High values of :math:`t` will give you a very low :math:`p_{loss}`, but
-:math:`p_{disc}` could easily exceed :math:`p_d` itself. Very low values of
+High values of :math:`t` will give you a very low :math:`p_{disc}`, but
+:math:`p_{loss}` could easily exceed :math:`p_l` itself. Very low values of
 :math:`t` will do the reverse. Unless you're far more concerned with one over
 the other, :math:`t` should typically be 40-60% of :math:`n`.
 
