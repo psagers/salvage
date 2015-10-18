@@ -83,7 +83,7 @@ class Salvage(object):
 
         new_parser = sub.add_parser(
             'new',
-            help="Create a new salvate kit from a source file or directory.",
+            help="Create a new salvage kit from a source file or directory.",
             description="Protect sensitive data by encrypting it and splitting the key across a group of participants."
         )
         new_parser.add_argument('-o', '--output', type=self._path(True), default=os.getcwd(), help="The output directory [.].")
